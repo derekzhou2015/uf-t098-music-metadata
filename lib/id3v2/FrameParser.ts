@@ -1,0 +1,715 @@
+import initDebug from 'debug';
+import * as Token from 'token-types';
+import { defaultMaxMetadataEntries } from '../common/Allocation.js';
+import type { IWarningCollector } from '../common/MetadataCollector.js';
+import * as util from '../common/Util.js';
+import { decodeUintBE } from '../common/Util.js';
+import { Genres } from '../id3v1/ID3v1Parser.js';
+import { makeUnexpectedFileContentError } from '../ParseError.js';
+import type { IComment, ILyricsTag } from '../type.js';
+import { getFrameHeaderLength, readFrameHeader } from './FrameHeader.js';
+import { ChapterInfo, type IChapterInfo } from './ID3v2ChapterToken.js';
+import {
+  AttachedPictureType,
+  type ID3v2MajorVersion,
+  type ITextEncoding,
+  SyncTextHeader,
+  TextEncodingToken,
+  TextHeader
+} from './ID3v2Token.js';
+
+const debug = initDebug('music-metadata:id3v2:frame-parser');
+
+interface IPicture {
+  type?: string;
+  description?: string;
+  format?: string;
+  data?: Uint8Array;
+}
+
+interface ICustomTag {
+  owner_identifier: string;
+}
+
+export interface ICustomDataTag extends ICustomTag {
+  data: Uint8Array;
+}
+
+export interface IIdentifierTag extends ICustomTag {
+  identifier: Uint8Array;
+}
+
+export interface ITextTag {
+  description: string;
+  text: string[];
+}
+
+export interface IPopularimeter {
+  email: string;
+  rating: number;
+  counter?: number;
+}
+
+export interface IGeneralEncapsulatedObject {
+  type: string;
+  filename: string;
+  description: string;
+  data: Uint8Array;
+}
+
+export type Chapter = {
+  label: string;
+  info: IChapterInfo;
+  frames: Map<string, unknown>;
+};
+
+export type TableOfContents = {
+  label: string;
+  flags: {
+    /** If set, this is the top-level table of contents */
+    topLevel: boolean;
+    /** If set, the child element IDs are in a defined order */
+    ordered: boolean;
+  };
+  childElementIds: string[];
+  frames: Map<string, unknown>;
+};
+
+const defaultEnc = 'latin1'; // latin1 == iso-8859-1;
+const urlEnc: ITextEncoding = { encoding: defaultEnc, bom: false };
+
+export function parseGenre(origVal: string, maxEntries = defaultMaxMetadataEntries): string[] {
+  // match everything inside parentheses
+  const genres: string[] = [];
+  const addGenre = (genre: string): void => {
+    if (genres.length >= maxEntries) {
+      throw new Id3v2ContentError(`TCON value count ${genres.length + 1} exceeds entry limit ${maxEntries}`);
+    }
+    genres.push(genre);
+  };
+  let word: string | undefined = '';
+  for (let offset = 0; offset < origVal.length; ) {
+    const open = origVal.indexOf('(', offset);
+    if (open < 0) {
+      word += origVal.slice(offset);
+      break;
+    }
+    word += origVal.slice(offset, open);
+    if (origVal[open + 1] === '(') {
+      word += '(';
+      offset = open + 2;
+      continue;
+    }
+    const close = origVal.indexOf(')', open + 1);
+    if (close < 0) {
+      break;
+    }
+    if (word !== '') {
+      addGenre(word);
+      word = '';
+    }
+    const genre = parseGenreCode(origVal.slice(open + 1, close));
+    if (genre) {
+      addGenre(genre);
+    }
+    offset = close + 1;
+  }
+  if (word) {
+    if (genres.length === 0 && word.match(/^\d*$/)) {
+      word = parseGenreCode(word);
+    }
+    if (word) {
+      addGenre(word);
+    }
+  }
+  return genres;
+}
+
+function parseGenreCode(code: string): string | undefined {
+  if (code === 'RX') {
+    return 'Remix';
+  }
+  if (code === 'CR') {
+    return 'Cover';
+  }
+  if (code.match(/^\d*$/)) {
+    return Genres[Number.parseInt(code, 10)];
+  }
+}
+
+export class FrameParser {
+  private embeddedFrameDepth = 0;
+  private major: ID3v2MajorVersion;
+
+  private warningCollector: IWarningCollector;
+
+  /**
+   * Create id3v2 frame parser
+   * @param major - Major version, e.g. (4) for  id3v2.4
+   * @param warningCollector - Used to collect decode issue
+   */
+  constructor(
+    major: ID3v2MajorVersion,
+    warningCollector: IWarningCollector,
+    private readonly maxEntries = defaultMaxMetadataEntries
+  ) {
+    this.major = major;
+    this.warningCollector = warningCollector;
+  }
+
+  private readonly validateTextValues = (count: number, context: string): void => {
+    if (count > this.maxEntries) {
+      throw new Id3v2ContentError(`${context} value count ${count} exceeds entry limit ${this.maxEntries}`);
+    }
+  };
+
+  public readData(uint8Array: Uint8Array, type: string, includeCovers: boolean) {
+    if (uint8Array.length === 0) {
+      if (type === 'CHAP' || type === 'CTOC') {
+        throw new Id3v2ContentError(`Truncated ${type} header`);
+      }
+      this.warningCollector.addWarning(`id3v2.${this.major} header has empty tag type=${type}`);
+      return;
+    }
+    const { encoding, bom } = TextEncodingToken.get(uint8Array, 0);
+    const length = uint8Array.length;
+    let offset = 0;
+    let output: unknown = []; // ToDo
+    const nullTerminatorLength = FrameParser.getNullTerminatorLength(encoding);
+    let fzero: number;
+
+    debug(`Parsing tag type=${type}, encoding=${encoding}, bom=${bom}`);
+    switch (type !== 'TXXX' && type[0] === 'T' ? 'T*' : type) {
+      case 'T*': // 4.2.1. Text information frames - details
+      case 'GRP1': // iTunes-specific ID3v2 grouping field
+      case 'GP1': // iTunes-specific ID3v2.2 grouping field
+      case 'IPL': // v2.2: Involved people list
+      case 'IPLS': // v2.3: Involved people list
+      case 'MVIN':
+      case 'MVNM':
+      case 'PCS':
+      case 'PCST': {
+        let text: string;
+        try {
+          text = FrameParser.trimNullPadding(util.decodeString(uint8Array.subarray(1), encoding));
+        } catch (error) {
+          if (error instanceof Error) {
+            this.warningCollector.addWarning(
+              `id3v2.${this.major} type=${type} header has invalid string value: ${error.message}`
+            );
+            break;
+          }
+          throw error;
+        }
+        switch (type) {
+          case 'TMCL': // Musician credits list
+          case 'TIPL': // Involved people list
+          case 'IPL': // v2.2: Involved people list
+          case 'IPLS': // Involved people list
+            output = this.functionList(this.splitValue(type, text));
+            break;
+          case 'TRK':
+          case 'TRCK':
+          case 'TPOS':
+          case 'TIT1':
+          case 'TIT2':
+          case 'TIT3':
+            output = text;
+            break;
+          case 'TCOM':
+          case 'TEXT':
+          case 'TOLY':
+          case 'TOPE':
+          case 'TPE1':
+          case 'TSRC':
+            // id3v2.3 defines that TCOM, TEXT, TOLY, TOPE & TPE1 values are separated by /
+            output = this.splitValue(type, text);
+            break;
+          case 'TCO':
+          case 'TCON': {
+            const genres: string[] = [];
+            for (const value of this.splitValue(type, text)) {
+              for (const genre of parseGenre(value, this.maxEntries)) {
+                this.validateTextValues(genres.length + 1, 'TCON');
+                genres.push(genre);
+              }
+            }
+            output = genres;
+            break;
+          }
+          case 'PCS':
+          case 'PCST':
+            // TODO: Why `default` not results `1` but `''`?
+            output = this.major >= 4 ? this.splitValue(type, text) : [text];
+            output = Array.isArray(output) && output[0] === '' ? 1 : 0;
+            break;
+          default:
+            output = this.major >= 4 ? this.splitValue(type, text) : [text];
+        }
+        break;
+      }
+
+      case 'TXXX': {
+        const idAndData = FrameParser.readIdentifierAndData(uint8Array.subarray(1), encoding);
+        output = {
+          description: idAndData.id,
+          text: this.splitValue(
+            type,
+            FrameParser.trimNullPadding(util.decodeString(idAndData.data, encoding)),
+            idAndData.id
+          )
+        };
+        break;
+      }
+
+      case 'PIC':
+      case 'APIC':
+        if (includeCovers) {
+          const pic: IPicture = {};
+
+          uint8Array = uint8Array.subarray(1);
+
+          switch (this.major) {
+            case 2:
+              pic.format = util.decodeString(uint8Array.subarray(0, 3), 'latin1'); // 'latin1'; // latin1 == iso-8859-1;
+              uint8Array = uint8Array.subarray(3);
+              break;
+            case 3:
+            case 4:
+              fzero = util.findZero(uint8Array, defaultEnc);
+              pic.format = util.decodeString(uint8Array.subarray(0, fzero), defaultEnc);
+              uint8Array = uint8Array.subarray(fzero + 1);
+              break;
+
+            default:
+              throw makeUnexpectedMajorVersionError(this.major);
+          }
+
+          pic.format = FrameParser.fixPictureMimeType(pic.format);
+
+          pic.type = AttachedPictureType[uint8Array[0] as keyof typeof AttachedPictureType];
+          uint8Array = uint8Array.subarray(1);
+
+          fzero = util.findZero(uint8Array, encoding);
+          pic.description = util.decodeString(uint8Array.subarray(0, fzero), encoding);
+          uint8Array = uint8Array.subarray(fzero + nullTerminatorLength);
+          pic.data = uint8Array;
+          output = pic;
+        }
+        break;
+
+      case 'CNT':
+      case 'PCNT':
+        output = decodeUintBE(uint8Array);
+        break;
+
+      case 'SYLT': {
+        const syltHeader = SyncTextHeader.get(uint8Array, 0);
+        uint8Array = uint8Array.subarray(SyncTextHeader.len);
+
+        const result: ILyricsTag = {
+          descriptor: '',
+          language: syltHeader.language,
+          contentType: syltHeader.contentType,
+          timeStampFormat: syltHeader.timeStampFormat,
+          syncText: []
+        };
+
+        let readSyllables = false;
+        while (uint8Array.length > 0) {
+          const nullStr = FrameParser.readNullTerminatedString(uint8Array, syltHeader.encoding);
+          uint8Array = uint8Array.subarray(nullStr.len);
+
+          if (readSyllables) {
+            this.validateTextValues(result.syncText.length + 1, 'SYLT');
+            const timestamp = Token.UINT32_BE.get(uint8Array, 0);
+            uint8Array = uint8Array.subarray(Token.UINT32_BE.len);
+            result.syncText.push({
+              text: nullStr.text,
+              timestamp
+            });
+          } else {
+            result.descriptor = nullStr.text;
+            readSyllables = true;
+          }
+        }
+        output = result;
+        break;
+      }
+
+      case 'ULT':
+      case 'USLT':
+      case 'COM':
+      case 'COMM': {
+        const textHeader = TextHeader.get(uint8Array, offset);
+        offset += TextHeader.len;
+
+        const descriptorStr = FrameParser.readNullTerminatedString(uint8Array.subarray(offset), textHeader.encoding);
+        offset += descriptorStr.len;
+
+        const textStr = FrameParser.readNullTerminatedString(uint8Array.subarray(offset), textHeader.encoding);
+
+        const comment: IComment = {
+          language: textHeader.language,
+          descriptor: descriptorStr.text,
+          text: textStr.text
+        };
+
+        output = comment;
+        break;
+      }
+
+      case 'UFID': {
+        const ufid = FrameParser.readIdentifierAndData(uint8Array, defaultEnc);
+        output = { owner_identifier: ufid.id, identifier: ufid.data } as IIdentifierTag;
+        break;
+      }
+
+      case 'PRIV': {
+        // private frame
+        const priv = FrameParser.readIdentifierAndData(uint8Array, defaultEnc);
+        output = { owner_identifier: priv.id, data: priv.data } as ICustomDataTag;
+        break;
+      }
+
+      case 'POPM': {
+        // Popularimeter
+        uint8Array = uint8Array.subarray(offset);
+
+        const emailStr = FrameParser.readNullTerminatedString(uint8Array, urlEnc);
+        const email = emailStr.text;
+        uint8Array = uint8Array.subarray(emailStr.len);
+
+        if (uint8Array.length === 0) {
+          this.warningCollector.addWarning(`id3v2.${this.major} type=${type} POPM frame missing rating byte`);
+          output = { email, rating: 0, counter: undefined };
+          break;
+        }
+
+        const rating = Token.UINT8.get(uint8Array, 0);
+        const counterBytes = uint8Array.subarray(Token.UINT8.len);
+        output = {
+          email,
+          rating,
+          counter: counterBytes.length > 0 ? decodeUintBE(counterBytes) : undefined
+        };
+        break;
+      }
+
+      case 'GEOB': {
+        // General encapsulated object
+        // [encoding] <MIME> 0x00 <filename> 0x00/0x00 0x00 <description> 0x00/0x00 0x00 <data>
+        const encoding = TextEncodingToken.get(uint8Array, 0);
+        uint8Array = uint8Array.subarray(1);
+
+        const mimeTypeStr = FrameParser.readNullTerminatedString(uint8Array, urlEnc);
+        const mimeType = mimeTypeStr.text;
+        uint8Array = uint8Array.subarray(mimeTypeStr.len);
+
+        const filenameStr = FrameParser.readNullTerminatedString(uint8Array, encoding);
+        const filename = filenameStr.text;
+        uint8Array = uint8Array.subarray(filenameStr.len);
+
+        const descriptionStr = FrameParser.readNullTerminatedString(uint8Array, encoding);
+        const description = descriptionStr.text;
+        uint8Array = uint8Array.subarray(descriptionStr.len);
+
+        const geob: IGeneralEncapsulatedObject = {
+          type: mimeType,
+          filename,
+          description,
+          data: uint8Array
+        };
+        output = geob;
+        break;
+      }
+
+      // W-Frames:
+      case 'WCOM':
+      case 'WCOP':
+      case 'WOAF':
+      case 'WOAR':
+      case 'WOAS':
+      case 'WORS':
+      case 'WPAY':
+      case 'WPUB':
+        // Decode URL
+        output = FrameParser.readNullTerminatedString(uint8Array, urlEnc).text;
+        break;
+
+      case 'WXXX': {
+        // [encoding] <description> 0x00/0x00 0x00 <url>
+        const encoding = TextEncodingToken.get(uint8Array, 0);
+        uint8Array = uint8Array.subarray(1);
+
+        const descriptionStr = FrameParser.readNullTerminatedString(uint8Array, encoding);
+        const description = descriptionStr.text;
+        uint8Array = uint8Array.subarray(descriptionStr.len);
+
+        // URL is always ISO-8859-1
+        output = { description, url: FrameParser.trimNullPadding(util.decodeString(uint8Array, defaultEnc)) };
+        break;
+      }
+
+      case 'WFD':
+      case 'WFED': {
+        const encoding = TextEncodingToken.get(uint8Array, 0);
+        uint8Array = uint8Array.subarray(1);
+        output = FrameParser.readNullTerminatedString(uint8Array, encoding).text;
+        break;
+      }
+
+      case 'MCDI': {
+        // Music CD identifier
+        output = uint8Array.subarray(0, length);
+        break;
+      }
+
+      // ID3v2 Chapters 1.0
+      // https://mutagen-specs.readthedocs.io/en/latest/id3/id3v2-chapters-1.0.html#chapter-frame
+      case 'CHAP': {
+        //  // Chapter frame
+        debug('Reading CHAP');
+        fzero = uint8Array.indexOf(0);
+        if (fzero < 0) {
+          throw new Id3v2ContentError('Missing CHAP element ID terminator');
+        }
+        if (length - fzero - 1 < ChapterInfo.len) {
+          throw new Id3v2ContentError('Truncated CHAP header');
+        }
+
+        const chapter: Chapter = {
+          label: util.decodeString(uint8Array.subarray(0, fzero), defaultEnc),
+          info: ChapterInfo.get(uint8Array, fzero + 1),
+          frames: this.readEmbeddedFrames(uint8Array, fzero + 1 + ChapterInfo.len, includeCovers)
+        };
+        output = chapter;
+        break;
+      }
+
+      // ID3v2 Chapters 1.0
+      // https://mutagen-specs.readthedocs.io/en/latest/id3/id3v2-chapters-1.0.html#table-of-contents-frame
+      case 'CTOC': {
+        // Table of contents frame
+        debug('Reading CTOC');
+
+        // Element ID (null-terminated latin1)
+        const idEnd = uint8Array.indexOf(0);
+        if (idEnd < 0) {
+          throw new Id3v2ContentError('Missing CTOC element ID terminator');
+        }
+        if (length - idEnd - 1 < 2) {
+          throw new Id3v2ContentError('Truncated CTOC header');
+        }
+        const label = util.decodeString(uint8Array.subarray(0, idEnd), defaultEnc);
+        offset = idEnd + 1;
+
+        // Flags
+        const flags = Token.UINT8.get(uint8Array, offset++);
+        const topLevel = (flags & 0x02) !== 0;
+        const ordered = (flags & 0x01) !== 0;
+
+        // Child element IDs
+        const entryCount = Token.UINT8.get(uint8Array, offset++);
+        const childElementIds: string[] = [];
+        for (let i = 0; i < entryCount; i++) {
+          const end = uint8Array.indexOf(0, offset);
+          if (end < 0) {
+            throw new Id3v2ContentError('Truncated CTOC child element ID');
+          }
+          const childId = util.decodeString(uint8Array.subarray(offset, end), defaultEnc);
+          childElementIds.push(childId);
+          offset = end + 1;
+        }
+
+        const toc: TableOfContents = {
+          label,
+          flags: { topLevel, ordered },
+          childElementIds,
+          // Optional embedded sub-frames (e.g. TIT2) follow after the child list.
+          frames: this.readEmbeddedFrames(uint8Array, offset, includeCovers)
+        };
+
+        output = toc;
+        break;
+      }
+
+      default:
+        debug(`Warning: unsupported id3v2-tag-type: ${type}`);
+        break;
+    }
+
+    return output;
+  }
+
+  private readEmbeddedFrames(data: Uint8Array, offset: number, includeCovers: boolean): Map<string, unknown> {
+    const frames = new Map<string, unknown>();
+    const headerLength = getFrameHeaderLength(this.major);
+    while (offset < data.length) {
+      if (data.length - offset < headerLength) {
+        throw new Id3v2ContentError('Truncated embedded ID3v2 frame header');
+      }
+      const frame = readFrameHeader(data.subarray(offset), this.major, this.warningCollector);
+      offset += headerLength;
+      if (frame.length > data.length - offset) {
+        throw new Id3v2ContentError(
+          `Embedded ID3v2 frame ${frame.id} size ${frame.length} exceeds remaining chapter data`
+        );
+      }
+      this.validateTextValues(frames.size + 1, 'Embedded frame');
+      if (this.embeddedFrameDepth >= 32) {
+        throw new Id3v2ContentError('Embedded ID3v2 frame nesting exceeds limit 32');
+      }
+      ++this.embeddedFrameDepth;
+      let value: unknown;
+      try {
+        value = this.readData(data.subarray(offset, offset + frame.length), frame.id, includeCovers);
+      } finally {
+        --this.embeddedFrameDepth;
+      }
+      offset += frame.length;
+      frames.set(frame.id, value);
+    }
+    return frames;
+  }
+
+  protected static readNullTerminatedString(
+    uint8Array: Uint8Array,
+    encoding: ITextEncoding
+  ): { text: string; len: number } {
+    const originalLen = uint8Array.length;
+    const zeroIndex = util.findZero(uint8Array, encoding.encoding);
+    if (zeroIndex >= originalLen) {
+      // No terminator found, decode the whole buffer
+      return {
+        text: util.decodeString(uint8Array, encoding.encoding),
+        len: originalLen
+      };
+    }
+
+    const txt = uint8Array.subarray(0, zeroIndex);
+    return {
+      text: util.decodeString(txt, encoding.encoding),
+      len: zeroIndex + FrameParser.getNullTerminatorLength(encoding.encoding)
+    };
+  }
+
+  protected static fixPictureMimeType(pictureType: string): string {
+    pictureType = pictureType.toLocaleLowerCase();
+    switch (pictureType) {
+      case 'jpg':
+        return 'image/jpeg';
+      case 'png':
+        return 'image/png';
+    }
+    return pictureType;
+  }
+
+  /**
+   * Converts TMCL (Musician credits list) or TIPL (Involved people list)
+   * @param entries
+   */
+  private functionList(entries: string[]): { [index: string]: string[] } {
+    const roles = new Map<string, string[]>();
+    for (let i = 0; i < entries.length; i += 2) {
+      const role = entries[i];
+      const people = entries[i + 1];
+      if (role === undefined || people === undefined) {
+        break;
+      }
+      const names = util.splitText(people, ',', 'people-list', this.validateTextValues, { keepEmpty: true });
+      roles.set(role, (roles.get(role) ?? []).concat(names));
+    }
+    return Object.fromEntries(roles);
+  }
+
+  /**
+   * id3v2.4 defines that multiple T* values are separated by 0x00
+   * id3v2.3 defines that TCOM, TEXT, TOLY, TOPE & TPE1 values are separated by /
+   * (TCON/TCO genre values are NOT slash-separated in ID3v2.3)
+   * @param tag - Tag name
+   * @param text - Concatenated tag value
+   * @param description - User text description, for legacy slash-separated list compatibility
+   * @returns Split tag value
+   */
+  private splitValue(tag: string, text: string, description = ''): string[] {
+    let values: string[];
+    if (this.major < 4) {
+      values = util.splitText(text, '\0', tag, this.validateTextValues, { keepEmpty: true });
+      if (values.length > 1) {
+        // Involved-person lists use null-separated role/name pairs in all versions.
+        if (tag !== 'IPL' && tag !== 'IPLS') {
+          this.warningCollector.addWarning(`ID3v2.${this.major} ${tag} uses non standard null-separator.`);
+        }
+      } else if (
+        [
+          /* v2.3: */ 'TPE1',
+          'TPE2',
+          'TPE3',
+          'TPE4',
+          'TCOM',
+          'TEXT',
+          'TOLY',
+          'TOPE',
+          /* v2.2: */ 'TP1',
+          'TCM',
+          'TXT',
+          'TOA',
+          'TOL',
+          'TSRC',
+          // Retain legacy support for nonstandard slash-separated credits.
+          'IPL',
+          'IPLS'
+        ].includes(tag) ||
+        // Preserve arbitrary TXXX text (XML, URLs, paths, etc.). Only known list
+        // descriptions retain compatibility with Picard's legacy '/' separator.
+        // https://picard-docs.musicbrainz.org/en/v2.13/config/options_tags_compatibility_id3.html
+        (tag === 'TXXX' &&
+          [
+            'ARTISTS',
+            'MUSICBRAINZ ARTIST ID',
+            'MUSICBRAINZ ALBUM ARTIST ID',
+            'MUSICBRAINZ ALBUM TYPE',
+            'ISRC'
+          ].includes(description.toUpperCase()))
+      ) {
+        // note that field Genre (TCON/TCO) is NOT in this list:
+        // a genre like "Duo Cello/Piano" must stay intact
+        values = util.splitText(text, '/', tag, this.validateTextValues, { keepEmpty: true });
+      }
+    } else {
+      values = util.splitText(text, '\0', tag, this.validateTextValues, { keepEmpty: true });
+    }
+    return FrameParser.trimArray(values);
+  }
+
+  private static trimArray(values: string[]): string[] {
+    return values.map(value => FrameParser.trimNullPadding(value).trim());
+  }
+
+  private static trimNullPadding(value: string): string {
+    let end = value.length;
+    while (end > 0 && value.charCodeAt(end - 1) === 0) {
+      end--;
+    }
+    return end === value.length ? value : value.slice(0, end);
+  }
+
+  private static readIdentifierAndData(
+    uint8Array: Uint8Array,
+    encoding: util.StringEncoding
+  ): { id: string; data: Uint8Array } {
+    const idStr = FrameParser.readNullTerminatedString(uint8Array, { encoding, bom: false });
+    return { id: idStr.text, data: uint8Array.subarray(idStr.len) };
+  }
+
+  private static getNullTerminatorLength(enc: util.StringEncoding): number {
+    return enc.startsWith('utf-16') ? 2 : 1;
+  }
+}
+
+export class Id3v2ContentError extends makeUnexpectedFileContentError('id3v2') {}
+
+function makeUnexpectedMajorVersionError(majorVer: number) {
+  throw new Id3v2ContentError(`Unexpected majorVer: ${majorVer}`);
+}

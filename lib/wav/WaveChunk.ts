@@ -1,0 +1,189 @@
+import type { IGetToken } from 'strtok3';
+import * as Token from 'token-types';
+import type { IChunkHeader } from '../iff/index.js';
+import { makeUnexpectedFileContentError } from '../ParseError.js';
+
+export class WaveContentError extends makeUnexpectedFileContentError('Wave') {}
+
+/**
+ * Ref: https://msdn.microsoft.com/en-us/library/windows/desktop/dd317599(v=vs.85).aspx
+ */
+export const WaveFormat = {
+  PCM: 0x0001,
+  ADPCM: 0x0002,
+  IEEE_FLOAT: 0x0003,
+  ALAW: 0x0006,
+  MULAW: 0x0007,
+  DVI_ADPCM: 0x0011,
+  GSM610: 0x0031,
+  // MPEG-4 and AAC Audio Types
+  MPEG_ADTS_AAC: 0x1600,
+  MPEG_LOAS: 0x1602,
+  RAW_AAC1: 0x00ff,
+  // Dolby Audio Types
+  DOLBY_AC3_SPDIF: 0x0092,
+  DVM: 0x2000,
+  RAW_SPORT: 0x0240,
+  ESST_AC3: 0x0241,
+  DRM: 0x0009,
+  DTS2: 0x2001,
+  MPEG: 0x0050,
+  MPEGLAYER3: 0x0055,
+  FLAC: 0xf1ac,
+  // The actual format is identified by the SubFormat GUID
+  EXTENSIBLE: 0xfffe
+};
+export type WaveFormat = (typeof WaveFormat)[keyof typeof WaveFormat];
+
+export const WaveFormatNameMap = {
+  [WaveFormat.PCM]: 'PCM',
+  [WaveFormat.ADPCM]: 'ADPCM',
+  [WaveFormat.IEEE_FLOAT]: 'IEEE_FLOAT',
+  [WaveFormat.ALAW]: 'ALAW',
+  [WaveFormat.MULAW]: 'MULAW',
+  [WaveFormat.DVI_ADPCM]: 'DVI_ADPCM',
+  [WaveFormat.GSM610]: 'GSM610',
+  [WaveFormat.MPEG_ADTS_AAC]: 'MPEG_ADTS_AAC',
+  [WaveFormat.MPEG_LOAS]: 'MPEG_LOAS',
+  [WaveFormat.RAW_AAC1]: 'RAW_AAC1',
+  [WaveFormat.DOLBY_AC3_SPDIF]: 'DOLBY_AC3_SPDIF',
+  [WaveFormat.DVM]: 'DVM',
+  [WaveFormat.RAW_SPORT]: 'RAW_SPORT',
+  [WaveFormat.ESST_AC3]: 'ESST_AC3',
+  [WaveFormat.DRM]: 'DRM',
+  [WaveFormat.DTS2]: 'DTS2',
+  [WaveFormat.MPEG]: 'MPEG',
+  [WaveFormat.MPEGLAYER3]: 'MPEGLAYER3',
+  [WaveFormat.FLAC]: 'FLAC'
+};
+
+/**
+ * "fmt"  sub-chunk describes the sound data's format
+ * Ref: http://soundfile.sapp.org/doc/WaveFormat
+ */
+export interface IWaveFormat {
+  /**
+   * Effective format tag. For WAVE_FORMAT_EXTENSIBLE this is the tag from SubFormat.
+   */
+  wFormatTag: WaveFormat;
+  /**
+   * Mono = 1, Stereo = 2, etc.
+   */
+  nChannels: number;
+  /**
+   * 8000, 44100, etc.
+   */
+  nSamplesPerSec: number;
+  nAvgBytesPerSec: number;
+  nBlockAlign: number;
+  wBitsPerSample: number;
+  /**
+   * Valid bits per sample from WAVEFORMATEXTENSIBLE, when present.
+   */
+  wValidBitsPerSample?: number;
+}
+
+/**
+ * Common suffix of the KSDATAFORMAT_SUBTYPE_* GUIDs used by WAVE_FORMAT_EXTENSIBLE.
+ * The first four bytes contain the WAVE format tag.
+ */
+const WaveFormatExtensibleSubFormatSuffix = new Uint8Array([
+  0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71
+]);
+
+function hasStandardSubFormatGuid(buf: Uint8Array, off: number): boolean {
+  for (let i = 0; i < WaveFormatExtensibleSubFormatSuffix.length; i++) {
+    if (buf[off + i] !== WaveFormatExtensibleSubFormatSuffix[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Uncompressed or lossless WAVE formats.
+ */
+export function isLosslessWaveFormat(wFormatTag: WaveFormat): boolean {
+  return wFormatTag === WaveFormat.PCM || wFormatTag === WaveFormat.IEEE_FLOAT || wFormatTag === WaveFormat.FLAC;
+}
+
+/**
+ * PCM in a WAVEFORMATEXTENSIBLE container may use fewer valid bits than the
+ * container size, for example 20-bit samples stored in 24-bit words.
+ */
+export function getBitsPerSample(format: IWaveFormat): number {
+  if (
+    format.wFormatTag === WaveFormat.PCM &&
+    format.wValidBitsPerSample !== undefined &&
+    format.wValidBitsPerSample > 0 &&
+    format.wValidBitsPerSample <= format.wBitsPerSample
+  ) {
+    return format.wValidBitsPerSample;
+  }
+  return format.wBitsPerSample;
+}
+
+/**
+ * format chunk; chunk-id is "fmt "
+ * http://soundfile.sapp.org/doc/WaveFormat/
+ */
+export class Format implements IGetToken<IWaveFormat> {
+  public len: number;
+
+  public constructor(header: IChunkHeader) {
+    if (header.chunkSize < 16) {
+      throw new WaveContentError('Invalid chunk size');
+    }
+    this.len = header.chunkSize;
+  }
+
+  public get(buf: Uint8Array, off: number): IWaveFormat {
+    let wFormatTag = Token.UINT16_LE.get(buf, off);
+    let wValidBitsPerSample: number | undefined;
+    if (wFormatTag === WaveFormat.EXTENSIBLE && this.len >= 40 && off + 40 <= buf.length) {
+      const cbSize = Token.UINT16_LE.get(buf, off + 16);
+      if (cbSize >= 22) {
+        wValidBitsPerSample = Token.UINT16_LE.get(buf, off + 18);
+        if (hasStandardSubFormatGuid(buf, off + 26)) {
+          wFormatTag = Token.UINT16_LE.get(buf, off + 24);
+        }
+      }
+    }
+
+    return {
+      wFormatTag: wFormatTag as WaveFormat,
+      nChannels: Token.UINT16_LE.get(buf, off + 2),
+      nSamplesPerSec: Token.UINT32_LE.get(buf, off + 4),
+      nAvgBytesPerSec: Token.UINT32_LE.get(buf, off + 8),
+      nBlockAlign: Token.UINT16_LE.get(buf, off + 12),
+      wBitsPerSample: Token.UINT16_LE.get(buf, off + 14),
+      wValidBitsPerSample
+    };
+  }
+}
+
+export interface IFactChunk {
+  dwSampleLength: number;
+}
+
+/**
+ * Fact chunk; chunk-id is "fact"
+ * http://www-mmsp.ece.mcgill.ca/Documents/AudioFormats/WAVE/WAVE.html
+ * http://www.recordingblogs.com/wiki/fact-chunk-of-a-wave-file
+ */
+export class FactChunk implements IGetToken<IFactChunk> {
+  public len: number;
+
+  public constructor(header: IChunkHeader) {
+    if (header.chunkSize < 4) {
+      throw new WaveContentError('Invalid fact chunk size.');
+    }
+    this.len = header.chunkSize;
+  }
+
+  public get(buf: Uint8Array, off: number): IFactChunk {
+    return {
+      dwSampleLength: Token.UINT32_LE.get(buf, off)
+    };
+  }
+}

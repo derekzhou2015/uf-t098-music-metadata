@@ -1,0 +1,204 @@
+/**
+ * Cross-platform entry point for reading and writing metadata.
+ */
+
+import type { Readable } from 'node:stream';
+import {
+  type AnyWebByteStream,
+  fromBlob,
+  fromBuffer,
+  fromWebStream,
+  type IFileInfo,
+  type IRandomAccessTokenizer,
+  type ITokenizer
+} from 'strtok3';
+import { APEv2Parser } from './apev2/APEv2Parser.js';
+import { getTokenizerOptions } from './common/Allocation.js';
+import { hasID3v1Header } from './id3v1/ID3v1Parser.js';
+import { getLyricsHeaderLength } from './lyrics3/Lyrics3.js';
+import { ParserFactory } from './ParserFactory.js';
+import type { IAudioMetadata, IOptions, IPicture, IPrivateOptions } from './type.js';
+
+export type { IFileInfo } from 'strtok3';
+export * from './ParseError.js';
+export { CouldNotDetermineFileTypeError, UnsupportedFileTypeError } from './ParseError.js';
+export {
+  type IAiffNativeTagMap,
+  type IAPEv2NativeTagMap,
+  type IAPEv2Picture,
+  type IAsfNativeTagMap,
+  type IAudioMetadata,
+  type IAudioTrack,
+  type ICafNativeTagMap,
+  type IChapter,
+  type ICommonTagsResult,
+  type IFormat,
+  type IID3v1NativeTagMap,
+  type IID3v22NativeTagMap,
+  type IID3v23NativeTagMap,
+  type IID3v24NativeTagMap,
+  type IITunesNativeTagMap,
+  type ILyricsTag,
+  type IMatroskaNativeTagMap,
+  type IMetadataEvent,
+  type IMetadataEventTag,
+  type INativeAudioMetadata,
+  type INativeTag,
+  type INativeTagDict,
+  type INativeTags,
+  type INativeTagTypeMap,
+  type INativeTagValueMap,
+  type IOptions,
+  type IPicture,
+  type IRatio,
+  type IRiffNativeTagMap,
+  type ITag,
+  type ITrackInfo,
+  type ITypedNativeTagDict,
+  type ITypedNativeTags,
+  type IVideoTrack,
+  type IVorbisNativeTagMap,
+  LyricsContentType,
+  TimestampFormat,
+  TrackType
+} from './type.js';
+export * from './write/browser.js';
+
+/**
+ * Parse Web API File
+ * Requires Blob to be able to stream using a ReadableStreamBYOBReader, only available since Node.js ≥ 20
+ * @param blob - Blob to parse
+ * @param options - Parsing options
+ * @returns Metadata
+ */
+export async function parseBlob(blob: Blob, options: IOptions = {}): Promise<IAudioMetadata> {
+  const tokenizer = fromBlob(blob, getTokenizerOptions(options));
+  try {
+    return await parseFromTokenizer(tokenizer, options);
+  } finally {
+    await tokenizer.close();
+  }
+}
+
+/**
+ * Parse audio from Web Stream.Readable
+ * @param webStream - WebStream to read the audio track from
+ * @param options - Parsing options
+ * @param fileInfo - File information object or MIME-type string
+ * @returns Metadata
+ */
+export async function parseWebStream(
+  webStream: AnyWebByteStream,
+  fileInfo?: IFileInfo | string,
+  options: IOptions = {}
+): Promise<IAudioMetadata> {
+  const tokenizer = fromWebStream(
+    webStream,
+    getTokenizerOptions(options, typeof fileInfo === 'string' ? { mimeType: fileInfo } : fileInfo)
+  );
+  try {
+    return await parseFromTokenizer(tokenizer, options);
+  } finally {
+    await tokenizer.close();
+  }
+}
+
+/**
+ * Parse audio from memory
+ * @param uint8Array - Uint8Array holding audio data
+ * @param fileInfo - File information object or MIME-type string
+ * @param options - Parsing options
+ * @returns Metadata
+ * Ref: https://github.com/Borewit/strtok3/blob/e6938c81ff685074d5eb3064a11c0b03ca934c1d/src/index.ts#L15
+ */
+export async function parseBuffer(
+  uint8Array: Uint8Array,
+  fileInfo?: IFileInfo | string,
+  options: IOptions = {}
+): Promise<IAudioMetadata> {
+  const tokenizer = fromBuffer(
+    uint8Array,
+    getTokenizerOptions(options, typeof fileInfo === 'string' ? { mimeType: fileInfo } : fileInfo)
+  );
+  return parseFromTokenizer(tokenizer, options);
+}
+
+/**
+ * Parse audio from ITokenizer source
+ * @param tokenizer - Audio source implementing the tokenizer interface
+ * @param options - Parsing options
+ * @returns Metadata
+ */
+export function parseFromTokenizer(tokenizer: ITokenizer, options?: IOptions): Promise<IAudioMetadata> {
+  const parserFactory = new ParserFactory();
+  return parserFactory.parse(tokenizer, undefined, options);
+}
+
+/**
+ * Create a dictionary ordered by their tag id (key)
+ * @param nativeTags list of tags
+ * @returns tags indexed by id
+ */
+export { orderTags } from './common/Util.js';
+
+/**
+ * Convert rating to 1-5 star rating
+ * @param rating Normalized rating [0..1] (common.rating[n].rating)
+ * @returns Number of stars: 1, 2, 3, 4 or 5 stars
+ */
+export function ratingToStars(rating: number | undefined): number {
+  return rating === undefined ? 0 : 1 + Math.round(rating * 4);
+}
+
+/**
+ * Select most likely cover image.
+ * @param pictures Usually metadata.common.picture
+ * @return Cover image, if any, otherwise null
+ */
+export function selectCover(pictures?: IPicture[]): IPicture | null {
+  return (
+    pictures?.find(
+      picture => picture.type && ['front', 'cover', 'cover (front)'].includes(picture.type.toLowerCase())
+    ) ??
+    pictures?.[0] ??
+    null
+  );
+}
+
+export async function scanAppendingHeaders(tokenizer: IRandomAccessTokenizer, options: IPrivateOptions = {}) {
+  let apeOffset = tokenizer.fileInfo.size;
+  if (await hasID3v1Header(tokenizer)) {
+    apeOffset -= 128;
+    const lyricsLen = await getLyricsHeaderLength(tokenizer);
+    apeOffset -= lyricsLen;
+  }
+
+  options.apeHeader = await APEv2Parser.findApeFooterOffset(tokenizer, apeOffset);
+}
+
+/**
+ * Implementation only available when loaded as Node.js
+ * This method will throw an Error, always.
+ */
+export async function parseFile(_filePath: string, _options: IOptions = {}): Promise<IAudioMetadata> {
+  throw new Error('This function require a Node engine. To load Web API File objects use parseBlob instead.');
+}
+
+/**
+ * Implementation only available when loaded as Node.js
+ * This method will throw an Error, always.
+ */
+export async function parseStream(
+  _stream: Readable,
+  _fileInfo?: IFileInfo | string,
+  _options: IOptions = {}
+): Promise<IAudioMetadata> {
+  throw new Error('This function require a Node engine.');
+}
+
+/**
+ * Return a list of supported mime-types
+ */
+export function getSupportedMimeTypes(): string[] {
+  return new ParserFactory().getSupportedMimeTypes();
+}

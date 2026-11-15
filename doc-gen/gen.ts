@@ -1,0 +1,76 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { CombinedTagMapper } from '../lib/common/CombinedTagMapper.js';
+import { commonTagsKeys, isSingleton } from '../lib/common/GenericTagTypes.js';
+import { id3v24TagMap } from '../lib/id3v2/ID3v24TagMapper.js';
+
+import * as markDown from './MarkDown.js';
+
+interface ITagInfoDict {
+  [key: string]: { description: string };
+}
+
+const combinedTagMapper = new CombinedTagMapper();
+// PRIV owners are case-sensitive, unlike the mapper's normalized lookup keys.
+const privateTagNames = new Map(
+  Object.keys(id3v24TagMap)
+    .filter(tag => tag.startsWith('PRIV:'))
+    .map(tag => [tag.toUpperCase(), tag])
+);
+const filename = fileURLToPath(import.meta.url);
+const dirname = path.dirname(filename);
+
+function getNativeSourceTags(nativeType: string, commonTag: string): string[] {
+  const result: string[] = [];
+
+  const tagMapper = combinedTagMapper.tagMappers[nativeType];
+  Object.keys(tagMapper.tagMap).forEach(nativeTag => {
+    if (commonTag === tagMapper.tagMap[nativeTag]) {
+      result.push(privateTagNames.get(nativeTag) ?? nativeTag);
+    }
+  });
+  return result;
+}
+
+function generateTable(previous: string): string {
+  const json = fs.readFileSync(path.join(dirname, 'common.json'), { encoding: 'utf-8' });
+  const commonDescriptionDict: ITagInfoDict = JSON.parse(json);
+
+  const table = new markDown.Table();
+
+  table.header = new markDown.Row(['Common tag', 'n', 'Description']);
+
+  for (const nativeType in combinedTagMapper.tagMappers) {
+    table.header.values.push(nativeType);
+  }
+
+  for (const commonTagKey of commonTagsKeys) {
+    const tagInfo = commonDescriptionDict[commonTagKey];
+    if (!tagInfo) {
+      throw new Error(`${commonTagKey} not found`);
+    }
+    // console.log('common-tag: key=%s, description=%s', commonTagKey, tagInfo.description)
+    const multiplicity = isSingleton(commonTagKey) ? '1' : '*';
+
+    const row = new markDown.Row([commonTagKey, multiplicity, tagInfo.description]);
+    for (const nativeType in combinedTagMapper.tagMappers) {
+      row.values.push(getNativeSourceTags(nativeType, commonTagKey).join(', '));
+    }
+    table.rows.push(row);
+  }
+
+  return table.toString(previous);
+}
+
+const outputPath = path.join(dirname, '..', 'doc', 'common_metadata.md');
+const previous = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf-8') : '';
+const content =
+  '# Common Metadata\n\n' +
+  'Common tags, and _native_ to _common_ tag mappings. _n_ indicates the multiplicity.\n' +
+  'The tag mapping is strongly inspired on the [MusicBrainz Picard tag-mapping](https://picard.musicbrainz.org/docs/mappings/).\n\n' +
+  generateTable(previous);
+
+if (content !== previous) {
+  fs.writeFileSync(outputPath, content);
+}

@@ -1,0 +1,769 @@
+import { defaultMaxMetadataEntries } from '../common/Allocation.js';
+// ASF Objects
+
+import {
+  createTokenizerView,
+  EndOfStreamError,
+  type IGetToken,
+  type ITokenizer,
+  TokenizerBoundaryError
+} from 'strtok3';
+import * as Token from 'token-types';
+
+import { AttachedPictureType } from '../id3v2/ID3v2Token.js';
+import { makeUnexpectedFileContentError } from '../ParseError.js';
+import type { AnyTagValue, IAudioTrack, IPicture, ITag, IVideoTrack } from '../type.js';
+import AsfGuid from './AsfGuid.js';
+import { getParserForAttr, parseUnicodeAttr } from './AsfUtil.js';
+
+export class AsfContentParseError extends makeUnexpectedFileContentError('ASF') {}
+
+/** Synchronous reads restricted to one declared ASF object payload. */
+class ByteCursor {
+  private readonly data: Uint8Array;
+  private position = 0;
+
+  public constructor(
+    buf: Uint8Array,
+    off: number,
+    length: number,
+    private readonly context: string
+  ) {
+    if (off < 0 || length < 0 || length > buf.length - off) {
+      throw new AsfContentParseError(`Truncated ${context}`);
+    }
+    this.data = buf.subarray(off, off + length);
+  }
+
+  public get remaining(): number {
+    return this.data.length - this.position;
+  }
+
+  public require(length: number, message = `Truncated ${this.context}`): void {
+    if (length > this.remaining) {
+      throw new AsfContentParseError(message);
+    }
+  }
+
+  public read<T>(token: IGetToken<T>): T {
+    this.require(token.len);
+    const value = token.get(this.data, this.position);
+    this.position += token.len;
+    return value;
+  }
+
+  public bytes(length: number, message: string): Uint8Array {
+    this.require(length, message);
+    const start = this.position;
+    this.position += length;
+    return this.data.subarray(start, this.position);
+  }
+}
+
+/**
+ * Data Type: Specifies the type of information being stored. The following values are recognized.
+ */
+export const DataType = {
+  /**
+   * Unicode string. The data consists of a sequence of Unicode characters.
+   */
+  UnicodeString: 0,
+  /**
+   * BYTE array. The type of data is implementation-specific.
+   */
+  ByteArray: 1,
+  /**
+   * BOOL. The data is 2 bytes long and should be interpreted as a 16-bit unsigned integer. Only 0x0000 or 0x0001 are permitted values.
+   */
+  Bool: 2,
+  /**
+   * DWORD. The data is 4 bytes long and should be interpreted as a 32-bit unsigned integer.
+   */
+  DWord: 3,
+  /**
+   * QWORD. The data is 8 bytes long and should be interpreted as a 64-bit unsigned integer.
+   */
+  QWord: 4,
+  /**
+   * WORD. The data is 2 bytes long and should be interpreted as a 16-bit unsigned integer.
+   */
+  Word: 5
+};
+export type DataType = (typeof DataType)[keyof typeof DataType];
+
+/**
+ * Ref: https://msdn.microsoft.com/en-us/library/windows/desktop/ee663575
+ */
+export interface IAsfObjectHeader {
+  /**
+   * A GUID that identifies the object. 128 bits
+   */
+  objectId: AsfGuid;
+
+  /**
+   * The size of the object (64-bits)
+   */
+  objectSize: number;
+}
+
+/**
+ * Interface for: 3. ASF top-level Header Object
+ * Ref: http://drang.s4.xrea.com/program/tips/id3tag/wmp/03_asf_top_level_header_object.html#3
+ */
+export interface IAsfTopLevelObjectHeader extends IAsfObjectHeader {
+  numberOfHeaderObjects: number;
+}
+
+/**
+ * Token for: 3. ASF top-level Header Object
+ * Ref: http://drang.s4.xrea.com/program/tips/id3tag/wmp/03_asf_top_level_header_object.html#3
+ */
+export const TopLevelHeaderObjectToken: IGetToken<IAsfTopLevelObjectHeader, Uint8Array> = {
+  len: 30,
+
+  get: (buf, off): IAsfTopLevelObjectHeader => {
+    const base = HeaderObjectToken.get(buf, off);
+    if (base.objectSize < TopLevelHeaderObjectToken.len) {
+      throw new AsfContentParseError(`Invalid ASF top-level header object size: ${base.objectSize}`);
+    }
+
+    return {
+      ...base,
+      numberOfHeaderObjects: Token.UINT32_LE.get(buf, off + 24)
+      // reserved: 2 bytes
+    };
+  }
+};
+
+/**
+ * Token for: 3.1 Header Object (mandatory, one only)
+ * Ref: http://drang.s4.xrea.com/program/tips/id3tag/wmp/03_asf_top_level_header_object.html#3_1
+ */
+export const HeaderObjectToken: IGetToken<IAsfObjectHeader, Uint8Array> = {
+  len: 24,
+
+  get: (buf, off): IAsfObjectHeader => {
+    const objectSize = Token.UINT64_LE.get(buf, off + 16);
+    if (objectSize < BigInt(HeaderObjectToken.len) || objectSize > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new AsfContentParseError(`Invalid ASF header object size: ${objectSize}`);
+    }
+    const header = {
+      objectId: AsfGuid.fromBin(buf, off),
+      objectSize: Number(objectSize)
+    };
+    return header;
+  }
+};
+
+export abstract class State<T> implements IGetToken<T> {
+  public len: number;
+
+  constructor(header: IAsfObjectHeader) {
+    this.len = header.objectSize - HeaderObjectToken.len;
+  }
+
+  public abstract get(buf: Uint8Array, off: number): T;
+
+  protected postProcessTag(tags: ITag[], name: string, valueType: number, data: AnyTagValue) {
+    if (name === 'WM/Picture') {
+      tags.push({ id: name, value: WmPictureToken.fromBuffer(data as Uint8Array) });
+    } else {
+      const parseAttr = getParserForAttr(valueType);
+      if (!parseAttr) {
+        throw new AsfContentParseError(`unexpected value headerType: ${valueType}`);
+      }
+      const buffer = data as Uint8Array;
+      const minimumLength =
+        valueType === DataType.QWord
+          ? 8
+          : valueType === DataType.DWord
+            ? 4
+            : valueType === DataType.Bool || valueType === DataType.Word
+              ? 2
+              : 0;
+      if (buffer.length < minimumLength) {
+        throw new AsfContentParseError(`Truncated ASF attribute ${name} of type ${valueType}`);
+      }
+      tags.push({ id: name, value: parseAttr(buffer) });
+    }
+  }
+}
+
+/**
+ * Interface for: 3.2: File Properties Object (mandatory, one only)
+ *
+ * The File Properties Object defines the global characteristics of the combined digital media streams found within the Data Object.
+ */
+export interface IFilePropertiesObject {
+  /**
+   * Specifies the unique identifier for this file.
+   * The value of this field shall be regenerated every time the file is modified in any way.
+   * The value of this field shall be identical to the value of the File ID field of the Data Object.
+   */
+  fileId: AsfGuid;
+
+  /**
+   * Specifies the size, in bytes, of the entire file.
+   * The value of this field is invalid if the Broadcast Flag bit in the Flags field is set to 1.
+   */
+  fileSize: bigint;
+  /**
+   * Specifies the date and time of the initial creation of the file. The value is given as the number of 100-nanosecond
+   * intervals since January 1, 1601, according to Coordinated Universal Time (Greenwich Mean Time). The value of this
+   * field may be invalid if the Broadcast Flag bit in the Flags field is set to 1.
+   */
+  creationDate: bigint;
+  /**
+   * Specifies the number of Data Packet entries that exist within the Data Object. The value of this field is invalid
+   * if the Broadcast Flag bit in the Flags field is set to 1.
+   */
+  dataPacketsCount: bigint;
+  /**
+   * Specifies the time needed to play the file in 100-nanosecond units.
+   * This value should include the duration (estimated, if an exact value is unavailable) of the the last media object
+   * in the presentation. The value of this field is invalid if the Broadcast Flag bit in the Flags field is set to 1.
+   */
+  playDuration: bigint;
+  /**
+   * Specifies the time needed to send the file in 100-nanosecond units.
+   * This value should include the duration of the last packet in the content.
+   * The value of this field is invalid if the Broadcast Flag bit in the Flags field is set to 1.
+   * Players can ignore this value.
+   */
+  sendDuration: bigint;
+  /**
+   * Specifies the amount of time to buffer data before starting to play the file, in millisecond units.
+   * If this value is nonzero, the Play Duration field and all of the payload Presentation Time fields have been offset
+   * by this amount. Therefore, player software must subtract the value in the preroll field from the play duration and
+   * presentation times to calculate their actual values. It follows that all payload Presentation Time fields need to
+   * be at least this value.
+   */
+  preroll: bigint;
+  /**
+   * The flags
+   */
+  flags: {
+    /**
+     * Specifies, if set, that a file is in the process of being created (for example, for recording applications),
+     * and thus that various values stored in the header objects are invalid. It is highly recommended that
+     * post-processing be performed to remove this condition at the earliest opportunity.
+     */
+    broadcast: boolean;
+    /**
+     * Specifies, if set, that a file is seekable.
+     * Note that for files containing a single audio stream and a Minimum Data Packet Size field equal to the Maximum
+     * Data Packet Size field, this flag shall always be set to 1.
+     * For files containing a single audio stream and a video stream or mutually exclusive video streams,
+     * this flag is only set to 1 if the file contains a matching Simple Index Object for each regular video stream
+     * (that is, video streams that are not hidden according to the method described in section 8.2.2).
+     */
+    seekable: boolean;
+  };
+  /**
+   * Specifies the minimum Data Packet size in bytes. In general, the value of this field is invalid if the Broadcast
+   * Flag bit in the Flags field is set to 1.
+   * However, for the purposes of this specification, the values for the Minimum Data Packet Size and Maximum Data
+   * Packet Size fields shall be set to the same value, and this value should be set to the packet size, even when the
+   * Broadcast Flag in the Flags field is set to 1.
+   */
+  minimumDataPacketSize: number;
+  /**
+   * Specifies the maximum Data Packet size in bytes.
+   * In general, the value of this field is invalid if the Broadcast Flag bit in the Flags field is set to 1.
+   * However, for the purposes of this specification, the values of the Minimum Data Packet Size and Maximum Data Packet
+   * Size fields shall be set to the same value,
+   * and this value should be set to the packet size, even when the Broadcast Flag field is set to 1.
+   */
+  maximumDataPacketSize: number;
+  /**
+   * Specifies the maximum instantaneous bit rate in bits per second for the entire file.
+   * This shall equal the sum of the bit rates of the individual digital media streams.
+   * It shall be noted that the digital media stream includes ASF data packetization overhead as well as digital media
+   * data in payloads.
+   * Only those streams that have a free-standing Stream Properties Object in the header shall have their bit rates
+   * included in the sum;
+   * streams whose Stream Properties Object exists as part of an Extended Stream Properties Object in the Header
+   * Extension Object shall not have their bit rates included in this sum, except when this value would otherwise be 0.
+   */
+  maximumBitrate: number;
+}
+
+/**
+ * Token for: 3.2: File Properties Object (mandatory, one only)
+ * Ref: http://drang.s4.xrea.com/program/tips/id3tag/wmp/03_asf_top_level_header_object.html#3_2
+ */
+export class FilePropertiesObject extends State<IFilePropertiesObject> {
+  public static guid = AsfGuid.FilePropertiesObject;
+
+  public get(buf: Uint8Array, off: number): IFilePropertiesObject {
+    const flags = Token.UINT32_LE.get(buf, off + 64);
+    return {
+      fileId: AsfGuid.fromBin(buf, off),
+      fileSize: Token.UINT64_LE.get(buf, off + 16),
+      creationDate: Token.UINT64_LE.get(buf, off + 24),
+      dataPacketsCount: Token.UINT64_LE.get(buf, off + 32),
+      playDuration: Token.UINT64_LE.get(buf, off + 40),
+      sendDuration: Token.UINT64_LE.get(buf, off + 48),
+      preroll: Token.UINT64_LE.get(buf, off + 56),
+      flags: {
+        broadcast: (flags & 1) !== 0,
+        seekable: (flags & 2) !== 0
+      },
+      // flagsNumeric: Token.UINT32_LE.get(buf, off + 64),
+      minimumDataPacketSize: Token.UINT32_LE.get(buf, off + 68),
+      maximumDataPacketSize: Token.UINT32_LE.get(buf, off + 72),
+      maximumBitrate: Token.UINT32_LE.get(buf, off + 76)
+    };
+  }
+}
+
+/**
+ * Interface for: 3.3 Stream Properties Object (mandatory, one per stream)
+ */
+export interface IStreamPropertiesObject {
+  /**
+   * Stream Type
+   */
+  streamType: string | undefined;
+
+  /**
+   * Error Correction Type
+   */
+  errorCorrectionType: AsfGuid;
+  streamNumber: number;
+  codecId?: string;
+  audio?: IAudioTrack;
+  video?: IVideoTrack;
+  bitrate?: number;
+}
+
+/**
+ * Token for: 3.3 Stream Properties Object (mandatory, one per stream)
+ * Ref: http://drang.s4.xrea.com/program/tips/id3tag/wmp/03_asf_top_level_header_object.html#3_3
+ */
+export class StreamPropertiesObject extends State<IStreamPropertiesObject> {
+  public static guid = AsfGuid.StreamPropertiesObject;
+
+  public get(buf: Uint8Array, off: number): IStreamPropertiesObject {
+    const available = Math.min(this.len, buf.length - off);
+    if (available < 54) {
+      throw new AsfContentParseError('Truncated Stream Properties Object');
+    }
+    const typeSpecificSize = Token.UINT32_LE.get(buf, off + 40);
+    const correctionSize = Token.UINT32_LE.get(buf, off + 44);
+    if (typeSpecificSize + correctionSize > available - 54) {
+      throw new AsfContentParseError('ASF stream data exceeds Stream Properties Object payload');
+    }
+    const result: IStreamPropertiesObject = {
+      streamType: AsfGuid.decodeMediaType(AsfGuid.fromBin(buf, off)),
+      errorCorrectionType: AsfGuid.fromBin(buf, off + 16),
+      streamNumber: Token.UINT16_LE.get(buf, off + 48) & 0x7f
+    };
+    const data = off + 54;
+    if (result.streamType === 'audio' && typeSpecificSize >= 16) {
+      result.codecId = `0x${Token.UINT16_LE.get(buf, data).toString(16).padStart(4, '0')}`;
+      result.audio = {
+        channels: Token.UINT16_LE.get(buf, data + 2),
+        samplingFrequency: Token.UINT32_LE.get(buf, data + 4)
+      };
+      const bitDepth = Token.UINT16_LE.get(buf, data + 14);
+      if (bitDepth > 0) {
+        result.audio.bitDepth = bitDepth;
+      }
+      const bytesPerSecond = Token.UINT32_LE.get(buf, data + 8);
+      if (bytesPerSecond > 0) {
+        result.bitrate = bytesPerSecond * 8;
+      }
+    } else if (result.streamType === 'video' && typeSpecificSize >= 11) {
+      result.video = {
+        pixelWidth: Token.UINT32_LE.get(buf, data),
+        pixelHeight: Token.UINT32_LE.get(buf, data + 4)
+      };
+      // ASF specification 9.2: DWORD width, DWORD height, BYTE flags, WORD format size.
+      // The packed BITMAPINFOHEADER follows at +11; its compression DWORD is at +16.
+      const formatSize = Token.UINT16_LE.get(buf, data + 9);
+      if (formatSize > typeSpecificSize - 11) {
+        throw new AsfContentParseError('ASF video format data exceeds stream data');
+      }
+      if (formatSize >= 20) {
+        result.codecId = new Token.StringType(4, 'ascii').get(buf, data + 27);
+      }
+    }
+    return result;
+  }
+}
+
+export interface IHeaderExtensionObject {
+  reserved1: AsfGuid;
+  reserved2: number;
+  extensionDataSize: number;
+}
+
+/**
+ * 3.4: Header Extension Object (mandatory, one only)
+ * Ref: http://drang.s4.xrea.com/program/tips/id3tag/wmp/03_asf_top_level_header_object.html#3_4
+ */
+export class HeaderExtensionObject implements IGetToken<IHeaderExtensionObject> {
+  public static guid = AsfGuid.HeaderExtensionObject;
+
+  public len: number;
+
+  public constructor() {
+    this.len = 22;
+  }
+
+  public get(buf: Uint8Array, off: number): IHeaderExtensionObject {
+    if (off < 0 || this.len > buf.length - off) {
+      throw new AsfContentParseError('Truncated Header Extension Object');
+    }
+    const view = new DataView(buf.buffer, buf.byteOffset + off, this.len);
+    return {
+      reserved1: AsfGuid.fromBin(buf, off),
+      reserved2: view.getUint16(16, true),
+      extensionDataSize: view.getUint32(18, true)
+    };
+  }
+}
+
+/**
+ * 3.5: The Codec-List-Object interface.
+ */
+interface ICodecListObjectHeader {
+  entryCount: number;
+}
+
+/**
+ * 3.5: The Codec List Object provides user-friendly information about the codecs and formats used to encode the content found in the ASF file.
+ * Ref: http://drang.s4.xrea.com/program/tips/id3tag/wmp/03_asf_top_level_header_object.html#3_5
+ */
+const CodecListObjectHeader: IGetToken<ICodecListObjectHeader> = {
+  len: 20,
+  get: (buf: Uint8Array, off: number): ICodecListObjectHeader => {
+    const view = new DataView(buf.buffer, off);
+    return {
+      entryCount: view.getUint16(16, true)
+    };
+  }
+};
+
+export interface ICodecEntry {
+  type: {
+    videoCodec: boolean;
+    audioCodec: boolean;
+  };
+  codecName: string;
+  description: string;
+  information: Uint8Array;
+}
+
+async function readString(reader: ITokenizer): Promise<string> {
+  const length = await reader.readNumber(Token.UINT16_LE);
+  return (await reader.readToken(new Token.StringType(length * 2, 'utf-16le'))).replace('\0', '');
+}
+
+/**
+ * 3.5: Read the Codec-List-Object, which provides user-friendly information about the codecs and formats used to encode the content found in the ASF file.
+ * Ref: http://drang.s4.xrea.com/program/tips/id3tag/wmp/03_asf_top_level_header_object.html#3_5
+ */
+export async function readCodecEntries(
+  tokenizer: ITokenizer,
+  payloadSize: number,
+  maxEntries = defaultMaxMetadataEntries
+): Promise<ICodecEntry[]> {
+  const reader = createTokenizerView(tokenizer, payloadSize);
+  const entries: ICodecEntry[] = [];
+  try {
+    const codecHeader = await reader.readToken(CodecListObjectHeader);
+    if (codecHeader.entryCount > maxEntries) {
+      throw new AsfContentParseError(
+        `ASF Codec List entry count ${codecHeader.entryCount} exceeds entry limit ${maxEntries}`
+      );
+    }
+    for (let i = 0; i < codecHeader.entryCount; ++i) {
+      entries.push(await readCodecEntry(reader));
+    }
+    await reader.consumeRemainder();
+  } catch (error) {
+    if (error instanceof EndOfStreamError || error instanceof TokenizerBoundaryError) {
+      throw new AsfContentParseError(`Unexpected end of ASF Codec List Object: ${error.message}`);
+    }
+    throw error;
+  } finally {
+    await reader.close();
+  }
+  return entries;
+}
+
+async function readInformation(reader: ITokenizer): Promise<Uint8Array> {
+  const length = await reader.readNumber(Token.UINT16_LE);
+  return reader.readToken(new Token.Uint8ArrayType(length));
+}
+
+/**
+ * Read Codec-Entries
+ * @param reader
+ */
+async function readCodecEntry(reader: ITokenizer): Promise<ICodecEntry> {
+  const type = await reader.readNumber(Token.UINT16_LE);
+  return {
+    type: {
+      videoCodec: (type & 0x0001) === 0x0001,
+      audioCodec: (type & 0x0002) === 0x0002
+    },
+    codecName: await readString(reader),
+    description: await readString(reader),
+    information: await readInformation(reader)
+  };
+}
+
+/**
+ * 3.10 Content Description Object (optional, one only)
+ * Ref: http://drang.s4.xrea.com/program/tips/id3tag/wmp/03_asf_top_level_header_object.html#3_10
+ */
+export class ContentDescriptionObjectState extends State<ITag[]> {
+  public static guid = AsfGuid.ContentDescriptionObject;
+
+  private static readonly contentDescTags = ['Title', 'Author', 'Copyright', 'Description', 'Rating'];
+
+  public get(buf: Uint8Array, off: number): ITag[] {
+    const cursor = new ByteCursor(buf, off, this.len, 'Content Description Object');
+    const lengths = cursor.bytes(10, 'Truncated Content Description Object');
+    const tags: ITag[] = [];
+    for (const [i, tagName] of ContentDescriptionObjectState.contentDescTags.entries()) {
+      const length = Token.UINT16_LE.get(lengths, i * 2);
+      const value = cursor.bytes(length, `${tagName} length ${length} exceeds Content Description payload`);
+      if (length > 0) {
+        tags.push({ id: tagName, value: parseUnicodeAttr(value) });
+      }
+    }
+    return tags;
+  }
+}
+
+/**
+ * 3.11 Extended Content Description Object (optional, one only)
+ * Ref: http://drang.s4.xrea.com/program/tips/id3tag/wmp/03_asf_top_level_header_object.html#3_11
+ */
+export class ExtendedContentDescriptionObjectState extends State<ITag[]> {
+  public static guid = AsfGuid.ExtendedContentDescriptionObject;
+
+  public get(buf: Uint8Array, off: number): ITag[] {
+    const cursor = new ByteCursor(buf, off, this.len, 'Extended Content Description Object');
+    const tags: ITag[] = [];
+    const attrCount = cursor.read(Token.UINT16_LE);
+    if (attrCount > cursor.remaining / 6) {
+      throw new AsfContentParseError('Extended Content Description count exceeds payload');
+    }
+    for (let i = 0; i < attrCount; i += 1) {
+      cursor.require(6, 'Truncated Extended Content Description record');
+      const nameLen = cursor.read(Token.UINT16_LE);
+      cursor.require(nameLen + 4, 'Extended Content Description name exceeds payload');
+      const name = parseUnicodeAttr(cursor.bytes(nameLen, 'Extended Content Description name exceeds payload'));
+      const valueType = cursor.read(Token.UINT16_LE);
+      const valueLen = cursor.read(Token.UINT16_LE);
+      const value = cursor.bytes(valueLen, 'Extended Content Description value exceeds payload');
+      this.postProcessTag(tags, name, valueType, value);
+    }
+    return tags;
+  }
+}
+
+export interface IStreamName {
+  streamLanguageId: number;
+  streamName: string;
+}
+
+/**
+ * 4.1 Extended Stream Properties Object (optional, 1 per media stream)
+ * Ref: http://drang.s4.xrea.com/program/tips/id3tag/wmp/04_objects_in_the_asf_header_extension_object.html#4_1
+ */
+export interface IExtendedStreamPropertiesObject {
+  startTime: bigint;
+  endTime: bigint;
+  dataBitrate: number;
+  bufferSize: number;
+  initialBufferFullness: number;
+  alternateDataBitrate: number;
+  alternateBufferSize: number;
+  alternateInitialBufferFullness: number;
+  maximumObjectSize: number;
+  flags: {
+    reliableFlag: boolean;
+    seekableFlag: boolean;
+    resendLiveCleanpointsFlag: boolean;
+  };
+  // flagsNumeric: Token.UINT32_LE.get(buf, off + 64),
+  streamNumber: number;
+  streamLanguageId: number;
+  averageTimePerFrame: number;
+  streamNameCount: number;
+  payloadExtensionSystems: number;
+  streamNames: IStreamName[];
+  streamPropertiesObject: IStreamPropertiesObject | null;
+}
+
+/**
+ * 4.1 Extended Stream Properties Object (optional, 1 per media stream)
+ * Ref: http://drang.s4.xrea.com/program/tips/id3tag/wmp/04_objects_in_the_asf_header_extension_object.html#4_1
+ */
+export class ExtendedStreamPropertiesObjectState extends State<IExtendedStreamPropertiesObject> {
+  public static guid = AsfGuid.ExtendedStreamPropertiesObject;
+
+  public get(buf: Uint8Array, off: number): IExtendedStreamPropertiesObject {
+    const end = off + Math.min(this.len, buf.length - off);
+    if (end - off < 64) {
+      throw new AsfContentParseError('Truncated Extended Stream Properties Object');
+    }
+    const flags = Token.UINT32_LE.get(buf, off + 44);
+    const result: IExtendedStreamPropertiesObject = {
+      startTime: Token.UINT64_LE.get(buf, off),
+      endTime: Token.UINT64_LE.get(buf, off + 8),
+      dataBitrate: Token.UINT32_LE.get(buf, off + 16),
+      bufferSize: Token.UINT32_LE.get(buf, off + 20),
+      initialBufferFullness: Token.UINT32_LE.get(buf, off + 24),
+      alternateDataBitrate: Token.UINT32_LE.get(buf, off + 28),
+      alternateBufferSize: Token.UINT32_LE.get(buf, off + 32),
+      alternateInitialBufferFullness: Token.UINT32_LE.get(buf, off + 36),
+      maximumObjectSize: Token.UINT32_LE.get(buf, off + 40),
+      flags: {
+        reliableFlag: (flags & 1) !== 0,
+        seekableFlag: (flags & 2) !== 0,
+        resendLiveCleanpointsFlag: (flags & 8) !== 0
+      },
+      streamNumber: Token.UINT16_LE.get(buf, off + 48) & 0x7f,
+      streamLanguageId: Token.UINT16_LE.get(buf, off + 50),
+      averageTimePerFrame: Number(Token.UINT64_LE.get(buf, off + 52)),
+      streamNameCount: Token.UINT16_LE.get(buf, off + 60),
+      payloadExtensionSystems: Token.UINT16_LE.get(buf, off + 62),
+      streamNames: [],
+      streamPropertiesObject: null
+    };
+    let cursor = off + 64;
+    const requireBytes = (length: number): void => {
+      if (length > end - cursor) {
+        throw new AsfContentParseError('ASF extended stream data exceeds object payload');
+      }
+    };
+    for (let index = 0; index < result.streamNameCount; ++index) {
+      requireBytes(4);
+      const language = Token.UINT16_LE.get(buf, cursor);
+      const length = Token.UINT16_LE.get(buf, cursor + 2);
+      cursor += 4;
+      requireBytes(length);
+      result.streamNames.push({
+        streamLanguageId: language,
+        streamName: parseUnicodeAttr(buf.subarray(cursor, cursor + length))
+      });
+      cursor += length;
+    }
+    for (let index = 0; index < result.payloadExtensionSystems; ++index) {
+      requireBytes(22);
+      const length = Token.UINT32_LE.get(buf, cursor + 18);
+      cursor += 22;
+      requireBytes(length);
+      cursor += length;
+    }
+    if (cursor < end) {
+      requireBytes(HeaderObjectToken.len);
+      const header = HeaderObjectToken.get(buf, cursor);
+      if (!header.objectId.equals(AsfGuid.StreamPropertiesObject) || header.objectSize !== end - cursor) {
+        throw new AsfContentParseError('Invalid embedded ASF Stream Properties Object');
+      }
+      result.streamPropertiesObject = new StreamPropertiesObject(header).get(buf, cursor + HeaderObjectToken.len);
+    }
+    return result;
+  }
+}
+
+/**
+ * 4.7  Metadata Object (optional, 0 or 1)
+ * Ref: http://drang.s4.xrea.com/program/tips/id3tag/wmp/04_objects_in_the_asf_header_extension_object.html#4_7
+ */
+export class MetadataObjectState extends State<ITag[]> {
+  public static guid = AsfGuid.MetadataObject;
+
+  public get(uint8Array: Uint8Array, off: number): ITag[] {
+    const cursor = new ByteCursor(uint8Array, off, this.len, 'Metadata Object');
+    const tags: ITag[] = [];
+    const descriptionRecordsCount = cursor.read(Token.UINT16_LE);
+    if (descriptionRecordsCount > cursor.remaining / 12) {
+      throw new AsfContentParseError('Metadata record count exceeds payload');
+    }
+    for (let i = 0; i < descriptionRecordsCount; i += 1) {
+      cursor.require(12, 'Truncated Metadata record header');
+      cursor.read(Token.UINT32_LE); // Reserved and stream number
+      const nameLen = cursor.read(Token.UINT16_LE);
+      const dataType = cursor.read(Token.UINT16_LE);
+      const dataLen = cursor.read(Token.UINT32_LE);
+      const name = parseUnicodeAttr(cursor.bytes(nameLen, 'Metadata name exceeds payload'));
+      const data = cursor.bytes(dataLen, 'Metadata value exceeds payload');
+      this.postProcessTag(tags, name, dataType, data);
+    }
+    return tags;
+  }
+}
+
+// 4.8	Metadata Library Object (optional, 0 or 1)
+
+export class MetadataLibraryObjectState extends MetadataObjectState {
+  public static guid = AsfGuid.MetadataLibraryObject;
+}
+
+export interface IWmPicture extends IPicture {
+  type: string;
+  format: string;
+  description: string;
+  size: number;
+  data: Uint8Array;
+}
+
+/**
+ * Ref: https://msdn.microsoft.com/en-us/library/windows/desktop/dd757977(v=vs.85).aspx
+ */
+export class WmPictureToken implements IGetToken<IWmPicture> {
+  public static fromBuffer(buffer: Uint8Array): IWmPicture {
+    const pic = new WmPictureToken(buffer.length);
+    return pic.get(buffer, 0);
+  }
+
+  public len: number;
+
+  constructor(len: number) {
+    this.len = len;
+  }
+
+  public get(buffer: Uint8Array, offset: number): IWmPicture {
+    const payload = buffer.subarray(offset, offset + this.len);
+    if (payload.length < 5) {
+      throw new AsfContentParseError('Truncated ASF picture header');
+    }
+    const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+
+    const typeId = view.getUint8(0);
+    const size = view.getUint32(1, true);
+    let index = 5;
+
+    const readString = (field: string): string => {
+      const start = index;
+      while (index + 2 <= payload.length) {
+        const codeUnit = view.getUint16(index, true);
+        index += 2;
+        if (codeUnit === 0) {
+          return new Token.StringType(index - start - 2, 'utf-16le').get(payload, start);
+        }
+      }
+      throw new AsfContentParseError(`Unterminated ASF picture ${field}`);
+    };
+
+    const format = readString('MIME type');
+    const description = readString('description');
+
+    return {
+      type: AttachedPictureType[typeId as keyof typeof AttachedPictureType],
+      format,
+      description,
+      size,
+      data: payload.slice(index)
+    };
+  }
+}

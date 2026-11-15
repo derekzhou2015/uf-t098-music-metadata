@@ -1,0 +1,1212 @@
+import { textDecode } from '@borewit/text-codec';
+import initDebug from 'debug';
+import type { IGetToken, IToken } from 'strtok3';
+import * as Token from 'token-types';
+import { defaultMaxChapterCount } from '../common/Allocation.js';
+import { FourCcToken } from '../common/FourCC.js';
+import * as util from '../common/Util.js';
+import { FieldDecodingError, makeUnexpectedFileContentError } from '../ParseError.js';
+import type { IChapter } from '../type.js';
+
+const debug = initDebug('music-metadata:parser:MP4:atom');
+
+export class Mp4ContentError extends makeUnexpectedFileContentError('MP4') {}
+
+// Media indexes scale with duration and muxing, independently of user tags.
+export const maxMp4StructureEntries = 5_000_000;
+
+interface IVersionAndFlags {
+  /**
+   * A 1-byte specification of the version
+   */
+  version: number;
+
+  /**
+   * Three bytes of space for (future) flags.
+   */
+  flags: number;
+}
+
+export interface IAtomHeader {
+  length: bigint;
+  name: string;
+}
+
+export interface IAtomFtyp {
+  type: string;
+}
+
+/**
+ * Common interface for the mvhd (Movie Header) & mdhd (Media) atom
+ */
+export interface IAtomMxhd extends IVersionAndFlags {
+  /**
+   * A 32-bit integer that specifies (in seconds since midnight, January 1, 1904) when the media atom was created.
+   * It is strongly recommended that this value should be specified using coordinated universal time (UTC).
+   */
+  creationTime: Date;
+
+  /**
+   * A 32-bit integer that specifies (in seconds since midnight, January 1, 1904) when the media atom was changed.
+   * It is strongly recommended that this value should be specified using coordinated universal time (UTC).
+   */
+  modificationTime: Date;
+
+  /**
+   * A time value that indicates the time scale for this media—that is, the number of time units that pass per second in its time coordinate system.
+   */
+  timeScale: number;
+
+  /**
+   * Duration: the duration of this media in units of its time scale.
+   */
+  duration: number;
+}
+
+/**
+ * Interface for the parsed Movie Header Atom (mvhd)
+ */
+export interface IAtomMvhd extends IAtomMxhd {
+  /**
+   * Preferred rate: a 32-bit fixed-point number that specifies the rate at which to play this movie.
+   * A value of 1.0 indicates normal rate.
+   */
+  preferredRate: number;
+
+  /**
+   * Preferred volume: A 16-bit fixed-point number that specifies how loud to play this movie’s sound.
+   * A value of 1.0 indicates full volume.
+   */
+  preferredVolume: number;
+
+  /**
+   * Reserved: Ten bytes reserved for use by Apple. Set to 0.
+   */
+  // reserved: number,
+
+  /**
+   * Matrix structure: The matrix structure associated with this movie.
+   * A matrix shows how to map points from one coordinate space into another.
+   * See Matrices for a discussion of how display matrices are used in QuickTime.
+   */
+  // matrixStructure: ???;
+
+  /**
+   * Preview time: The time value in the movie at which the preview begins.
+   */
+  previewTime: number;
+
+  /**
+   * Preview duration: The duration of the movie preview in movie time scale units.
+   */
+  previewDuration: number;
+
+  /**
+   * Poster time: The time value of the time of the movie poster.
+   */
+  posterTime: number;
+
+  /**
+   * selection time: The time value for the start time of the current selection.
+   */
+  selectionTime: number;
+
+  /**
+   * Selection duration:  The duration of the current selection in movie time scale units.
+   */
+  selectionDuration: number;
+
+  /**
+   * Current time:  The time value for current time position within the movie.
+   */
+  currentTime: number;
+
+  /**
+   * Next track ID:  A 32-bit integer that indicates a value to use for the track ID number of the next track added to this movie. Note that 0 is not a valid track ID value.
+   */
+  nextTrackID: number;
+}
+
+/**
+ * Interface for the metadata header atom: 'mhdr'
+ * Ref: https://developer.apple.com/library/content/documentation/QuickTime/QTFF/Metadata/Metadata.html#//apple_ref/doc/uid/TP40000939-CH1-SW13
+ */
+export interface IMovieHeaderAtom extends IVersionAndFlags {
+  /**
+   * A 32-bit unsigned integer indicating the value to use for the item ID of the next item created or assigned an item ID.
+   * If the value is all ones, it indicates that future additions will require a search for an unused item ID.
+   */
+  nextItemID: number;
+}
+
+export const Header: IToken<IAtomHeader> = {
+  len: 8,
+
+  get: (buf: Uint8Array, off: number): IAtomHeader => {
+    const length = Token.UINT32_BE.get(buf, off);
+    if (length < 0) {
+      throw new Mp4ContentError('Invalid atom header length');
+    }
+
+    return {
+      length: BigInt(length),
+      name: new Token.StringType(4, 'latin1').get(buf, off + 4)
+    };
+  },
+
+  put: (buf: Uint8Array, off: number, hdr: IAtomHeader) => {
+    Token.UINT32_BE.put(buf, off, Number(hdr.length));
+    return FourCcToken.put(buf, off + 4, hdr.name);
+  }
+};
+
+/**
+ * Ref: https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/QTFFChap1/qtff1.html#//apple_ref/doc/uid/TP40000939-CH203-38190
+ */
+export const ExtendedSize: IToken<bigint> = Token.UINT64_BE;
+
+export const ftyp: IGetToken<IAtomFtyp> = {
+  len: 4,
+
+  get: (buf: Uint8Array, off: number): IAtomFtyp => {
+    return {
+      type: new Token.StringType(4, 'ascii').get(buf, off)
+    };
+  }
+};
+
+/**
+ * Token: Movie Header Atom
+ */
+export const mhdr: IGetToken<IMovieHeaderAtom> = {
+  len: 8,
+
+  get: (buf: Uint8Array, off: number): IMovieHeaderAtom => {
+    return {
+      version: Token.UINT8.get(buf, off),
+      flags: Token.UINT24_BE.get(buf, off + 1),
+      nextItemID: Token.UINT32_BE.get(buf, off + 4)
+    };
+  }
+};
+
+/**
+ * Base class for 'fixed' length atoms.
+ * In some cases these atoms are longer then the sum of the described fields.
+ * Issue: https://github.com/Borewit/music-metadata/issues/120
+ */
+export abstract class FixedLengthAtom {
+  public len: number;
+
+  /**
+   *
+   * @param {number} len Length as specified in the size field
+   * @param {number} expLen Total length of sum of specified fields in the standard
+   * @param atomId Atom ID
+   */
+  protected constructor(len: number, expLen: number, atomId: string) {
+    if (len < expLen) {
+      throw new Mp4ContentError(`Atom ${atomId} expected to be ${expLen}, but specifies ${len} bytes long.`);
+    }
+    if (len > expLen) {
+      debug(`Warning: atom ${atomId} expected to be ${expLen}, but was actually ${len} bytes long.`);
+    }
+
+    this.len = len;
+  }
+}
+
+/**
+ * Interface for the parsed Movie Header Atom (mdhd)
+ */
+export interface IAtomMdhd extends IAtomMxhd {
+  /**
+   * A 16-bit integer that specifies the language code for this media.
+   * See Language Code Values for valid language codes.
+   * Also see Extended Language Tag Atom for the preferred code to use here if an extended language tag is also included in the media atom.
+   * Ref: https://developer.apple.com/library/content/documentation/QuickTime/QTFF/QTFFChap4/qtff4.html#//apple_ref/doc/uid/TP40000939-CH206-34353
+   */
+  language: number;
+
+  quality: number;
+}
+
+/**
+ * Timestamp stored in seconds since Mac Epoch (1 January 1904)
+ */
+const SecondsSinceMacEpoch: IGetToken<Date> = {
+  len: 4,
+
+  get: (buf: Uint8Array, off: number): Date => {
+    const secondsSinceUnixEpoch = Token.UINT32_BE.get(buf, off) - 2082844800;
+    return new Date(secondsSinceUnixEpoch * 1000);
+  }
+};
+
+const SecondsSinceMacEpoch64: IGetToken<Date> = {
+  len: 8,
+
+  get: (buf: Uint8Array, off: number): Date => {
+    const secondsSinceUnixEpoch = Number(Token.UINT64_BE.get(buf, off)) - 2082844800;
+    return new Date(secondsSinceUnixEpoch * 1000);
+  }
+};
+
+/** Shared creation, modification and timing fields of media/movie headers. */
+function readTimeHeader(buf: Uint8Array, off: number): IAtomMxhd {
+  const version = Token.UINT8.get(buf, off);
+  const wide = version === 1;
+  const timestamp = wide ? SecondsSinceMacEpoch64 : SecondsSinceMacEpoch;
+  return {
+    version,
+    flags: Token.UINT24_BE.get(buf, off + 1),
+    creationTime: timestamp.get(buf, off + 4),
+    modificationTime: timestamp.get(buf, off + (wide ? 12 : 8)),
+    timeScale: Token.UINT32_BE.get(buf, off + (wide ? 20 : 12)),
+    duration: wide ? Number(Token.UINT64_BE.get(buf, off + 24)) : Token.UINT32_BE.get(buf, off + 16)
+  };
+}
+
+/**
+ * Token: Media Header Atom
+ * Ref:
+ * - https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/QTFFChap2/qtff2.html#//apple_ref/doc/uid/TP40000939-CH204-SW34
+ * - https://wiki.multimedia.cx/index.php/QuickTime_container#mdhd
+ */
+export class MdhdAtom extends FixedLengthAtom implements IGetToken<IAtomMdhd> {
+  public constructor(len: number) {
+    super(len, 24, 'mdhd');
+  }
+
+  public get(buf: Uint8Array, off: number): IAtomMdhd {
+    const version = Token.UINT8.get(buf, off);
+    if (version !== 0 && version !== 1) {
+      throw new FieldDecodingError('Invalid mdhd version header');
+    }
+    const tail = off + (version === 1 ? 32 : 20);
+    return {
+      ...readTimeHeader(buf, off),
+      language: Token.UINT16_BE.get(buf, tail),
+      quality: Token.UINT16_BE.get(buf, tail + 2)
+    };
+  }
+}
+
+/**
+ * Token: Movie Header Atom
+ */
+export class MvhdAtom extends FixedLengthAtom implements IGetToken<IAtomMvhd> {
+  public constructor(len: number) {
+    super(len, 100, 'mvhd');
+  }
+
+  public get(buf: Uint8Array, off: number): IAtomMvhd {
+    // Preserve the legacy 32-bit layout for versions other than 1.
+    const tail = off + (Token.UINT8.get(buf, off) === 1 ? 32 : 20);
+    return {
+      ...readTimeHeader(buf, off),
+      preferredRate: Token.UINT32_BE.get(buf, tail),
+      preferredVolume: Token.UINT16_BE.get(buf, tail + 4),
+      // Reserved (10 bytes) and matrix structure (36 bytes).
+      previewTime: Token.UINT32_BE.get(buf, tail + 52),
+      previewDuration: Token.UINT32_BE.get(buf, tail + 56),
+      posterTime: Token.UINT32_BE.get(buf, tail + 60),
+      selectionTime: Token.UINT32_BE.get(buf, tail + 64),
+      selectionDuration: Token.UINT32_BE.get(buf, tail + 68),
+      currentTime: Token.UINT32_BE.get(buf, tail + 72),
+      nextTrackID: Token.UINT32_BE.get(buf, tail + 76)
+    };
+  }
+}
+
+/**
+ * Data Atom Structure ('data')
+ * Ref: https://developer.apple.com/library/content/documentation/QuickTime/QTFF/Metadata/Metadata.html#//apple_ref/doc/uid/TP40000939-CH1-SW32
+ */
+export interface IDataAtom {
+  /**
+   * Type Indicator
+   * Ref: https://developer.apple.com/library/content/documentation/QuickTime/QTFF/Metadata/Metadata.html#//apple_ref/doc/uid/TP40000939-CH1-SW28
+   */
+  type: {
+    /**
+     * The set of types from which the type is drawn
+     * If 0, type is drawn from the well-known set of types.
+     */
+    set: number; // ToDo: enum?
+    type: number;
+  };
+  /**
+   * Locale Indicator
+   */
+  locale: number;
+  /**
+   * An array of bytes containing the value of the metadata.
+   */
+  value: Uint8Array;
+}
+
+/** Fixed type/locale header, shared by buffered and skipped values. */
+export const DataAtomHeader: IGetToken<Omit<IDataAtom, 'value'>> = {
+  len: 8,
+  get(buf, off) {
+    if (off < 0 || buf.length - off < 8) {
+      throw new Mp4ContentError('Truncated data atom header');
+    }
+    return {
+      type: { set: Token.UINT8.get(buf, off), type: Token.UINT24_BE.get(buf, off + 1) },
+      locale: Token.UINT32_BE.get(buf, off + 4)
+    };
+  }
+};
+
+/**
+ * Data Atom Structure ('data')
+ * Ref: https://developer.apple.com/library/content/documentation/QuickTime/QTFF/Metadata/Metadata.html#//apple_ref/doc/uid/TP40000939-CH1-SW32
+ */
+export interface INameAtom extends IVersionAndFlags {
+  /**
+   * An array of bytes containing the value of the metadata.
+   */
+  name: string;
+}
+
+/**
+ * Data Atom Structure
+ * Ref: https://developer.apple.com/library/content/documentation/QuickTime/QTFF/Metadata/Metadata.html#//apple_ref/doc/uid/TP40000939-CH1-SW31
+ */
+export class NameAtom implements IGetToken<INameAtom> {
+  public len: number;
+
+  public constructor(len: number) {
+    this.len = len;
+  }
+
+  public get(buf: Uint8Array, off: number): INameAtom {
+    return {
+      version: Token.UINT8.get(buf, off),
+      flags: Token.UINT24_BE.get(buf, off + 1),
+      name: new Token.StringType(this.len - 4, 'utf-8').get(buf, off + 4)
+    };
+  }
+}
+
+/**
+ * Track Header Atoms interface
+ * Ref: https://developer.apple.com/library/content/documentation/QuickTime/QTFF/QTFFChap2/qtff2.html#//apple_ref/doc/uid/TP40000939-CH204-25550
+ */
+export interface ITrackHeaderAtom extends IVersionAndFlags {
+  /**
+   * Creation Time
+   */
+  creationTime: Date;
+
+  /**
+   * Modification Time
+   */
+  modificationTime: Date;
+
+  /**
+   * TrackID
+   */
+  trackId: number;
+
+  /**
+   * A time value that indicates the duration of this track (in the movie’s time coordinate system).
+   * Note that this property is derived from the track’s edits. The value of this field is equal to the sum of the
+   * durations of all of the track’s edits. If there is no edit list, then the duration is the sum of the sample
+   * durations, converted into the movie timescale.
+   */
+  duration: number;
+
+  /**
+   * A 16-bit integer that indicates this track’s spatial priority in its movie.
+   * The QuickTime Movie Toolbox uses this value to determine how tracks overlay one another.
+   * Tracks with lower layer values are displayed in front of tracks with higher layer values.
+   */
+  layer: number;
+
+  /**
+   * A 16-bit integer that identifies a collection of movie tracks that contain alternate data for one another.
+   * This same identifier appears in each 'tkhd' atom of the other tracks in the group.
+   * QuickTime chooses one track from the group to be used when the movie is played.
+   * The choice may be based on such considerations as playback quality, language, or the capabilities of the computer.
+   * A value of zero indicates that the track is not in an alternate track group.
+   */
+  alternateGroup: number;
+  displayWidth?: number;
+  displayHeight?: number;
+
+  /**
+   * A 16-bit fixed-point value that indicates how loudly this track’s sound is to be played.
+   * A value of 1.0 indicates normal volume.
+   */
+  volume: number;
+}
+
+/**
+ * Track Header Atoms structure (`tkhd`)
+ * Ref: https://developer.apple.com/library/content/documentation/QuickTime/QTFF/QTFFChap2/qtff2.html#//apple_ref/doc/uid/TP40000939-CH204-25550
+ */
+export class TrackHeaderAtom implements IGetToken<ITrackHeaderAtom> {
+  public len: number;
+
+  public constructor(len: number) {
+    this.len = len;
+  }
+
+  public get(buf: Uint8Array, off: number): ITrackHeaderAtom {
+    const available = Math.min(this.len, buf.length - off);
+    if (available < 4) {
+      throw new Mp4ContentError('Truncated tkhd header');
+    }
+    const version = Token.UINT8.get(buf, off);
+    // Validate through the volume field, the last field currently decoded.
+    if ((version === 0 && available < 38) || (version === 1 && available < 50)) {
+      throw new Mp4ContentError('Truncated tkhd header');
+    }
+    const flags = Token.UINT24_BE.get(buf, off + 1);
+
+    switch (version) {
+      case 0:
+        // Version 0: 32-bit fields
+        return {
+          version,
+          flags,
+          creationTime: SecondsSinceMacEpoch.get(buf, off + 4),
+          modificationTime: SecondsSinceMacEpoch.get(buf, off + 8),
+          trackId: Token.UINT32_BE.get(buf, off + 12),
+          // reserved 4 bytes
+          duration: Token.UINT32_BE.get(buf, off + 20),
+          // reserved 8 bytes
+          layer: Token.UINT16_BE.get(buf, off + 32),
+          alternateGroup: Token.UINT16_BE.get(buf, off + 34),
+          volume: Token.UINT16_BE.get(buf, off + 36), // ToDo: fixed point
+          ...(available >= 84
+            ? {
+                displayWidth: Token.UINT32_BE.get(buf, off + 76) / 65536,
+                displayHeight: Token.UINT32_BE.get(buf, off + 80) / 65536
+              }
+            : {})
+        };
+
+      case 1:
+        // Version 1: 64-bit creation/modification times and duration
+        return {
+          version,
+          flags,
+          creationTime: SecondsSinceMacEpoch64.get(buf, off + 4),
+          modificationTime: SecondsSinceMacEpoch64.get(buf, off + 12),
+          trackId: Token.UINT32_BE.get(buf, off + 20),
+          // reserved 4 bytes
+          duration: Number(Token.UINT64_BE.get(buf, off + 28)),
+          // reserved 8 bytes
+          layer: Token.UINT16_BE.get(buf, off + 44),
+          alternateGroup: Token.UINT16_BE.get(buf, off + 46),
+          volume: Token.UINT16_BE.get(buf, off + 48), // ToDo: fixed point
+          ...(available >= 96
+            ? {
+                displayWidth: Token.UINT32_BE.get(buf, off + 88) / 65536,
+                displayHeight: Token.UINT32_BE.get(buf, off + 92) / 65536
+              }
+            : {})
+        };
+
+      default:
+        throw new FieldDecodingError('Invalid tkhd version header');
+    }
+  }
+}
+
+/**
+ * Atom: Sample Description Atom ('stsd')
+ */
+interface IAtomStsdHeader extends IVersionAndFlags {
+  numberOfEntries: number;
+}
+
+/**
+ * Atom: Sample Description Atom ('stsd')
+ * Ref: https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/QTFFChap2/qtff2.html#//apple_ref/doc/uid/TP40000939-CH204-25691
+ */
+const stsdHeader: IGetToken<IAtomStsdHeader> = {
+  len: 8,
+
+  get: (buf: Uint8Array, off: number): IAtomStsdHeader => {
+    return {
+      version: Token.UINT8.get(buf, off),
+      flags: Token.UINT24_BE.get(buf, off + 1),
+      numberOfEntries: Token.UINT32_BE.get(buf, off + 4)
+    };
+  }
+};
+
+/**
+ * Atom: Sample Description Atom ('stsd')
+ */
+export interface ISampleDescription {
+  dataFormat: string;
+  dataReferenceIndex: number;
+  description: Uint8Array | undefined;
+}
+
+export interface IAtomStsd {
+  header: IAtomStsdHeader;
+  table: ISampleDescription[];
+}
+
+/**
+ * Atom: Sample Description Atom ('stsd')
+ * Ref: https://developer.apple.com/documentation/quicktime-file-format/sample_description_atom
+ */
+class SampleDescriptionTable implements IGetToken<ISampleDescription> {
+  public len: number;
+
+  public constructor(len: number) {
+    this.len = len;
+  }
+
+  public get(buf: Uint8Array, off: number): ISampleDescription {
+    const descrLen = this.len - 12;
+    return {
+      dataFormat: FourCcToken.get(buf, off),
+      dataReferenceIndex: Token.UINT16_BE.get(buf, off + 10),
+      description: descrLen > 0 ? new Token.Uint8ArrayType(descrLen).get(buf, off + 12) : undefined
+    };
+  }
+}
+
+/**
+ * Atom: Sample-description Atom ('stsd')
+ * Ref: https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/QTFFChap2/qtff2.html#//apple_ref/doc/uid/TP40000939-CH204-25691
+ */
+export class StsdAtom implements IGetToken<IAtomStsd> {
+  public len: number;
+
+  public constructor(
+    len: number,
+    private readonly maxEntries = maxMp4StructureEntries
+  ) {
+    this.len = len;
+  }
+
+  public get(buf: Uint8Array, off: number): IAtomStsd {
+    const end = Math.min(off + this.len, buf.length);
+    if (end - off < stsdHeader.len) {
+      throw new Mp4ContentError('Truncated stsd header');
+    }
+    const header = stsdHeader.get(buf, off);
+    off += stsdHeader.len;
+
+    const table: ISampleDescription[] = [];
+
+    for (let n = 0; n < header.numberOfEntries; ++n) {
+      if (end - off < Token.UINT32_BE.len) {
+        throw new Mp4ContentError('Truncated stsd sample entry');
+      }
+      const size = Token.UINT32_BE.get(buf, off); // Sample description size
+      // A SampleEntry needs its size, format, reserved bytes and data reference index.
+      // Requiring it to fit also bounds the loop by the available payload, not entry_count.
+      if (size < 16 || size > end - off) {
+        throw new Mp4ContentError(`Invalid stsd sample entry size: ${size}`);
+      }
+      if (n >= this.maxEntries) {
+        throw new Mp4ContentError(`stsd entry count ${header.numberOfEntries} exceeds entry limit ${this.maxEntries}`);
+      }
+      off += Token.UINT32_BE.len;
+      table.push(new SampleDescriptionTable(size - Token.UINT32_BE.len).get(buf, off));
+      // A SampleEntry extends Box, so its size covers the size field already stepped over
+      off += size - Token.UINT32_BE.len;
+    }
+
+    return {
+      header,
+      table
+    };
+  }
+}
+
+export interface ISoundSampleDescriptionVersion {
+  version: number;
+  revision: number;
+  vendor: number;
+}
+
+/**
+ * Common Sound Sample Description (version & revision)
+ * Ref: https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/QTFFChap3/qtff3.html#//apple_ref/doc/uid/TP40000939-CH205-57317
+ */
+export const SoundSampleDescriptionVersion: IGetToken<ISoundSampleDescriptionVersion> = {
+  len: 8,
+
+  get(buf: Uint8Array, off: number): ISoundSampleDescriptionVersion {
+    return {
+      version: Token.INT16_BE.get(buf, off),
+      revision: Token.INT16_BE.get(buf, off + 2),
+      vendor: Token.INT32_BE.get(buf, off + 4)
+    };
+  }
+};
+
+export interface ISoundSampleDescriptionV0 {
+  numAudioChannels: number;
+  /**
+   * Number of bits in each uncompressed sound sample
+   */
+  sampleSize: number;
+  /**
+   * Compression ID
+   */
+  compressionId: number;
+
+  packetSize: number;
+
+  sampleRate: number;
+}
+
+/**
+ * Sound Sample Description (Version 0)
+ * Ref: https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/QTFFChap3/qtff3.html#//apple_ref/doc/uid/TP40000939-CH205-130736
+ */
+export const SoundSampleDescriptionV0: IGetToken<ISoundSampleDescriptionV0> = {
+  len: 12,
+
+  get(buf: Uint8Array, off: number): ISoundSampleDescriptionV0 {
+    return {
+      numAudioChannels: Token.INT16_BE.get(buf, off + 0),
+      sampleSize: Token.INT16_BE.get(buf, off + 2),
+      compressionId: Token.INT16_BE.get(buf, off + 4),
+      packetSize: Token.INT16_BE.get(buf, off + 6),
+      sampleRate: Token.UINT16_BE.get(buf, off + 8) + Token.UINT16_BE.get(buf, off + 10) / 10000
+    };
+  }
+};
+
+export interface ITableAtom<T> extends IVersionAndFlags {
+  numberOfEntries: number;
+  entries: T[];
+}
+
+class SimpleTableAtom<T> implements IGetToken<ITableAtom<T>> {
+  public len: number;
+  private token: IGetToken<T>;
+
+  public constructor(
+    len: number,
+    token: IGetToken<T>,
+    private readonly maxEntries = maxMp4StructureEntries
+  ) {
+    this.len = len;
+    this.token = token;
+  }
+
+  public get(buf: Uint8Array, off: number): ITableAtom<T> {
+    const nrOfEntries = Token.INT32_BE.get(buf, off + 4);
+
+    return {
+      version: Token.INT8.get(buf, off + 0),
+      flags: Token.INT24_BE.get(buf, off + 1),
+      numberOfEntries: nrOfEntries,
+      entries: readTokenTable(buf, this.token, off + 8, this.len - 8, nrOfEntries, this.maxEntries)
+    };
+  }
+}
+
+export interface ITimeToSampleToken {
+  count: number;
+  duration: number;
+}
+
+export const TimeToSampleToken: IGetToken<ITimeToSampleToken> = {
+  len: 8,
+
+  get(buf: Uint8Array, off: number): ITimeToSampleToken {
+    return {
+      count: Token.UINT32_BE.get(buf, off + 0),
+      duration: Token.UINT32_BE.get(buf, off + 4)
+    };
+  }
+};
+
+/**
+ * Time-to-sample('stts') atom.
+ * Store duration information for a media’s samples.
+ * Ref: https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/QTFFChap2/qtff2.html#//apple_ref/doc/uid/TP40000939-CH204-25696
+ */
+export class SttsAtom extends SimpleTableAtom<ITimeToSampleToken> {
+  public constructor(len: number, maxEntries?: number) {
+    super(len, TimeToSampleToken, maxEntries);
+  }
+}
+
+/**
+ * Sample-to-Chunk ('stsc') atom table entry interface
+ */
+export interface ISampleToChunk {
+  firstChunk: number;
+  samplesPerChunk: number;
+  sampleDescriptionId: number;
+}
+
+export const SampleToChunkToken: IGetToken<ISampleToChunk> = {
+  len: 12,
+
+  get(buf: Uint8Array, off: number): ISampleToChunk {
+    return {
+      firstChunk: Token.UINT32_BE.get(buf, off),
+      samplesPerChunk: Token.UINT32_BE.get(buf, off + 4),
+      sampleDescriptionId: Token.UINT32_BE.get(buf, off + 8)
+    };
+  }
+};
+
+/**
+ * Sample-to-Chunk ('stsc') atom interface
+ * Ref: https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/QTFFChap2/qtff2.html#//apple_ref/doc/uid/TP40000939-CH204-25706
+ */
+export class StscAtom extends SimpleTableAtom<ISampleToChunk> {
+  public constructor(len: number, maxEntries?: number) {
+    super(len, SampleToChunkToken, maxEntries);
+  }
+}
+
+/**
+ * Sample-size ('stsz') atom interface
+ */
+export interface IStszAtom extends ITableAtom<number> {
+  sampleSize: number;
+  totalSize?: number;
+}
+
+/**
+ * Sample-size ('stsz') atom
+ * Ref: https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/QTFFChap2/qtff2.html#//apple_ref/doc/uid/TP40000939-CH204-25710
+ */
+export class StszAtom implements IGetToken<IStszAtom> {
+  public len: number;
+
+  public constructor(
+    len: number,
+    // Retain only the prefix needed by chapter parsing; the complete table still contributes to totalSize.
+    private readonly maxRetainedEntries = 0
+  ) {
+    this.len = len;
+  }
+
+  public get(buf: Uint8Array, off: number): IStszAtom {
+    if (this.len < 12) {
+      throw new Mp4ContentError('Invalid stsz payload length');
+    }
+    const sampleSize = Token.UINT32_BE.get(buf, off + 4);
+    const numberOfEntries = Token.UINT32_BE.get(buf, off + 8);
+    const tableLength = this.len - 12;
+    // Preserve empty tables with a declared sample count; they provide no variable-size total.
+    if (tableLength !== 0 && tableLength !== numberOfEntries * Token.UINT32_BE.len) {
+      throw new Mp4ContentError('mismatch number-of-entries with remaining atom-length');
+    }
+    const tableEntries = tableLength / Token.UINT32_BE.len;
+    const retainedCount = Math.min(tableEntries, this.maxRetainedEntries);
+
+    const entries: number[] = [];
+    let totalSize = sampleSize * numberOfEntries;
+    for (let index = 0; index < tableEntries; ++index) {
+      const size = Token.UINT32_BE.get(buf, off + 12 + index * Token.UINT32_BE.len);
+      if (sampleSize === 0) {
+        totalSize += size;
+      }
+      if (index < retainedCount) {
+        entries.push(size);
+      }
+    }
+    return {
+      version: Token.INT8.get(buf, off),
+      flags: Token.INT24_BE.get(buf, off + 1),
+      sampleSize,
+      numberOfEntries,
+      totalSize: sampleSize > 0 || tableEntries > 0 ? totalSize : undefined,
+      entries
+    };
+  }
+}
+
+/**
+ * Chunk offset atom, 'stco'
+ * Ref: https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/QTFFChap2/qtff2.html#//apple_ref/doc/uid/TP40000939-CH204-25715
+ */
+export class StcoAtom extends SimpleTableAtom<number> {
+  public constructor(len: number, maxEntries?: number) {
+    super(len, Token.UINT32_BE, maxEntries);
+  }
+}
+
+/** 64-bit chunk offsets (co64), constrained to exact JavaScript positions. */
+export class Co64Atom extends SimpleTableAtom<number> {
+  public constructor(len: number, maxEntries?: number) {
+    super(
+      len,
+      {
+        len: 8,
+        get(buf: Uint8Array, off: number): number {
+          const offset = Token.UINT64_BE.get(buf, off);
+          if (offset > BigInt(Number.MAX_SAFE_INTEGER)) {
+            throw new Mp4ContentError('Chunk offset exceeds Number.MAX_SAFE_INTEGER');
+          }
+          return Number(offset);
+        }
+      },
+      maxEntries
+    );
+  }
+}
+
+/**
+ * Token used to decode text-track from 'mdat' atom (raw data stream)
+ */
+export class ChapterText implements IGetToken<string> {
+  public len: number;
+
+  public constructor(len: number) {
+    this.len = len;
+  }
+
+  public get(buf: Uint8Array, off: number): string {
+    const available = Math.min(this.len, buf.length - off);
+    if (available < 2) {
+      return '';
+    }
+    const titleLen = Math.min(Token.UINT16_BE.get(buf, off), available - 2);
+    const bytes = buf.subarray(off + 2, off + 2 + titleLen);
+    // QuickTime Unicode text uses UTF-8 unless a UTF-16 byte-order mark is present.
+    if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+      const littleEndian = new Uint8Array(bytes.length - 2);
+      for (let i = 2; i + 1 < bytes.length; i += 2) {
+        littleEndian[i - 2] = bytes[i + 1];
+        littleEndian[i - 1] = bytes[i];
+      }
+      return textDecode(littleEndian, 'utf-16le');
+    }
+    if (bytes[0] === 0xff && bytes[1] === 0xfe) {
+      return textDecode(bytes.subarray(2), 'utf-16le');
+    }
+    return textDecode(bytes);
+  }
+}
+
+/** Nero chapter list (chpl): UTF-8 titles and start times in 100ns units. */
+export class ChapterListAtom implements IGetToken<IChapter[]> {
+  public constructor(
+    public len: number,
+    private readonly maxChapters = defaultMaxChapterCount,
+    private readonly onLimit?: () => void
+  ) {}
+
+  public get(buf: Uint8Array, off: number): IChapter[] {
+    const end = off + Math.min(this.len, buf.length - off);
+    if (end - off < 5) {
+      return [];
+    }
+    const version = Token.UINT8.get(buf, off);
+    if (version > 1) {
+      throw new Mp4ContentError(`Unsupported chpl version: ${version}`);
+    }
+    let position = off + (version === 1 ? 8 : 4);
+    if (position >= end) {
+      return [];
+    }
+    const count = Token.UINT8.get(buf, position++);
+    if (count > this.maxChapters) {
+      this.onLimit?.();
+    }
+    const chapters: IChapter[] = [];
+    for (let i = 0; i < Math.min(count, this.maxChapters) && position + 9 <= end; ++i) {
+      const start = Token.UINT64_BE.get(buf, position);
+      const titleLength = Token.UINT8.get(buf, position + 8);
+      position += 9;
+      if (position + titleLength > end) {
+        break;
+      }
+      if (start > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Mp4ContentError('Chapter start exceeds Number.MAX_SAFE_INTEGER');
+      }
+      chapters.push({
+        title: textDecode(buf.subarray(position, position + titleLength)),
+        start: Number(start),
+        timeScale: 10_000_000
+      });
+      position += titleLength;
+    }
+    return chapters;
+  }
+}
+
+function readTokenTable<T>(
+  buf: Uint8Array,
+  token: IGetToken<T>,
+  off: number,
+  remainingLen: number,
+  numberOfEntries: number,
+  maxEntries = maxMp4StructureEntries
+): T[] {
+  debug(`remainingLen=${remainingLen}, numberOfEntries=${numberOfEntries} * token-len=${token.len}`);
+
+  if (remainingLen === 0) {
+    return [];
+  }
+
+  if (remainingLen !== numberOfEntries * token.len) {
+    throw new Mp4ContentError('mismatch number-of-entries with remaining atom-length');
+  }
+
+  if (numberOfEntries > maxEntries) {
+    throw new Mp4ContentError(`MP4 table entry count ${numberOfEntries} exceeds entry limit ${maxEntries}`);
+  }
+
+  const entries: T[] = [];
+  // parse offset-table
+  for (let n = 0; n < numberOfEntries; ++n) {
+    entries.push(token.get(buf, off));
+    off += token.len;
+  }
+
+  return entries;
+}
+
+interface ITrackFragmentHeaderBoxFlags {
+  baseDataOffsetPresent: boolean;
+  sampleDescriptionIndexPresent: boolean;
+  defaultSampleDurationPresent: boolean;
+  defaultSampleSizePresent: boolean;
+  defaultSampleFlagsPresent: boolean;
+  defaultDurationIsEmpty: boolean;
+  defaultBaseIsMoof: boolean;
+}
+
+export interface ITrackFragmentHeaderBox {
+  version: number;
+  flags: ITrackFragmentHeaderBoxFlags;
+  trackId: number;
+  baseDataOffset?: bigint;
+  sampleDescriptionIndex?: number;
+  defaultSampleDuration?: number;
+  defaultSampleSize?: number;
+  defaultSampleFlags?: number;
+}
+
+/**
+ * Sample-size ('tfhd') TrackFragmentHeaderBox
+ */
+export class TrackFragmentHeaderBox implements IGetToken<ITrackFragmentHeaderBox> {
+  public len: number;
+
+  public constructor(len: number) {
+    this.len = len;
+  }
+
+  public get(buf: Uint8Array, off: number): ITrackFragmentHeaderBox {
+    const flagOffset = off + 1;
+    const header: ITrackFragmentHeaderBox = {
+      version: Token.INT8.get(buf, off),
+      flags: {
+        baseDataOffsetPresent: util.getBit(buf, flagOffset + 2, 0),
+        sampleDescriptionIndexPresent: util.getBit(buf, flagOffset + 2, 1),
+        defaultSampleDurationPresent: util.getBit(buf, flagOffset + 2, 3),
+        defaultSampleSizePresent: util.getBit(buf, flagOffset + 2, 4),
+        defaultSampleFlagsPresent: util.getBit(buf, flagOffset + 2, 5),
+        defaultDurationIsEmpty: util.getBit(buf, flagOffset, 0),
+        defaultBaseIsMoof: util.getBit(buf, flagOffset, 1)
+      },
+      trackId: Token.UINT32_BE.get(buf, 4)
+    };
+
+    let dynOffset = 8;
+    if (header.flags.baseDataOffsetPresent) {
+      header.baseDataOffset = Token.UINT64_BE.get(buf, dynOffset);
+      dynOffset += 8;
+    }
+    if (header.flags.sampleDescriptionIndexPresent) {
+      header.sampleDescriptionIndex = Token.UINT32_BE.get(buf, dynOffset);
+      dynOffset += 4;
+    }
+    if (header.flags.defaultSampleDurationPresent) {
+      header.defaultSampleDuration = Token.UINT32_BE.get(buf, dynOffset);
+      dynOffset += 4;
+    }
+    if (header.flags.defaultSampleSizePresent) {
+      header.defaultSampleSize = Token.UINT32_BE.get(buf, dynOffset);
+      dynOffset += 4;
+    }
+    if (header.flags.defaultSampleFlagsPresent) {
+      header.defaultSampleFlags = Token.UINT32_BE.get(buf, dynOffset);
+    }
+
+    return header;
+  }
+}
+
+interface ITrackRunBoxFlags {
+  dataOffsetPresent: boolean;
+  firstSampleFlagsPresent: boolean;
+  sampleDurationPresent: boolean;
+  sampleSizePresent: boolean;
+  sampleFlagsPresent: boolean;
+  sampleCompositionTimeOffsetsPresent: boolean;
+}
+
+/**
+ * trun atom
+ */
+export interface ITrackRunBox {
+  version: number;
+  flags: ITrackRunBoxFlags;
+  /** Totals of explicitly stored sample fields; defaults are resolved after the complete traf. */
+  duration: number;
+  size: number;
+  timingComplete: boolean;
+  explicitSampleCount: number;
+  sampleCount: number;
+  dataOffset?: number;
+  firstSampleFlags?: number;
+}
+
+/**
+ * Sample-size ('trun') TrackRunBox
+ */
+export class TrackRunBox implements IGetToken<ITrackRunBox> {
+  public len: number;
+
+  public constructor(
+    len: number,
+    private readonly maxSampleCount = maxMp4StructureEntries
+  ) {
+    this.len = len;
+  }
+
+  public get(buf: Uint8Array, off: number): ITrackRunBox {
+    const flagOffset = off + 1;
+
+    const trun: ITrackRunBox = {
+      version: Token.INT8.get(buf, off),
+      flags: {
+        dataOffsetPresent: util.getBit(buf, flagOffset + 2, 0),
+        firstSampleFlagsPresent: util.getBit(buf, flagOffset + 2, 2),
+        sampleDurationPresent: util.getBit(buf, flagOffset + 1, 0),
+        sampleSizePresent: util.getBit(buf, flagOffset + 1, 1),
+        sampleFlagsPresent: util.getBit(buf, flagOffset + 1, 2),
+        sampleCompositionTimeOffsetsPresent: util.getBit(buf, flagOffset + 1, 3)
+      },
+      sampleCount: Token.UINT32_BE.get(buf, off + 4),
+      duration: 0,
+      size: 0,
+      timingComplete: true,
+      explicitSampleCount: 0
+    };
+
+    let dynOffset = off + 8;
+
+    if (trun.flags.dataOffsetPresent) {
+      trun.dataOffset = Token.UINT32_BE.get(buf, dynOffset);
+      dynOffset += 4;
+    }
+    if (trun.flags.firstSampleFlagsPresent) {
+      trun.firstSampleFlags = Token.UINT32_BE.get(buf, dynOffset);
+      dynOffset += 4;
+    }
+
+    const sampleFields =
+      Number(trun.flags.sampleDurationPresent) +
+      Number(trun.flags.sampleSizePresent) +
+      Number(trun.flags.sampleFlagsPresent) +
+      Number(trun.flags.sampleCompositionTimeOffsetsPresent);
+    if (dynOffset + sampleFields * 4 * trun.sampleCount > off + this.len) {
+      throw new Mp4ContentError('Invalid trun sample count');
+    }
+    // Default-only runs need no per-sample allocation, even for a large sample_count.
+    if (sampleFields === 0) {
+      return trun;
+    }
+    if (trun.sampleCount > this.maxSampleCount) {
+      throw new Mp4ContentError(`trun sample count ${trun.sampleCount} exceeds entry limit ${this.maxSampleCount}`);
+    }
+    for (let n = 0; n < trun.sampleCount; ++n) {
+      if (trun.flags.sampleDurationPresent) {
+        const duration = Token.UINT32_BE.get(buf, dynOffset);
+        trun.duration += duration;
+        trun.timingComplete &&= duration > 0;
+        dynOffset += 4;
+      }
+      if (trun.flags.sampleSizePresent) {
+        trun.size += Token.UINT32_BE.get(buf, dynOffset);
+        dynOffset += 4;
+      }
+      // The validated row width includes flags and composition offsets, which are not retained.
+      dynOffset += 4 * (Number(trun.flags.sampleFlagsPresent) + Number(trun.flags.sampleCompositionTimeOffsetsPresent));
+    }
+    trun.explicitSampleCount = trun.sampleCount;
+
+    return trun;
+  }
+}
+
+export interface IHandlerBox {
+  version: number;
+  flags: number;
+  componentType: string;
+  handlerType: string;
+  componentName: string;
+}
+
+/**
+ * HandlerBox (`hdlr`)
+ */
+export class HandlerBox implements IGetToken<IHandlerBox> {
+  public len: number;
+
+  public constructor(len: number) {
+    this.len = len;
+  }
+
+  public get(buf: Uint8Array, off: number): IHandlerBox {
+    const _flagOffset = off + 1;
+
+    const charTypeToken = new Token.StringType(4, 'utf-8');
+
+    return {
+      version: Token.INT8.get(buf, off),
+      flags: Token.UINT24_BE.get(buf, off + 1),
+      componentType: charTypeToken.get(buf, off + 4),
+      handlerType: charTypeToken.get(buf, off + 8),
+      componentName: new Token.StringType(this.len - 28, 'utf-8').get(buf, off + 28)
+    };
+  }
+}
+
+/**
+ * Chapter Track Reference Box (`chap`)
+ */
+export class ChapterTrackReferenceBox implements IGetToken<number[]> {
+  public len: number;
+
+  public constructor(
+    len: number,
+    private readonly maxEntries = maxMp4StructureEntries
+  ) {
+    this.len = len;
+  }
+
+  public get(buf: Uint8Array, off: number): number[] {
+    if (this.len % Token.UINT32_BE.len !== 0) {
+      throw new Mp4ContentError('Invalid chapter track-reference length');
+    }
+    const count = this.len / Token.UINT32_BE.len;
+    if (count > this.maxEntries) {
+      throw new Mp4ContentError(`Chapter track-reference count ${count} exceeds entry limit ${this.maxEntries}`);
+    }
+    let dynOffset = 0;
+    const trackIds: number[] = [];
+    while (dynOffset < this.len) {
+      trackIds.push(Token.UINT32_BE.get(buf, off + dynOffset));
+      dynOffset += 4;
+    }
+    return trackIds;
+  }
+}
