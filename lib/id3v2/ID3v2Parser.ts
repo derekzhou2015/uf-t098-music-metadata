@@ -53,7 +53,8 @@ export class ID3v2Parser {
     majorVer: ID3v2MajorVersion,
     includeCovers: boolean,
     warningCollector: IWarningCollector,
-    maxEntries: number
+    maxEntries: number,
+    tagUnsynchronisation: boolean
   ) {
     const frameParser = new FrameParser(majorVer, warningCollector, maxEntries);
     switch (majorVer) {
@@ -61,7 +62,10 @@ export class ID3v2Parser {
         return frameParser.readData(uint8Array, frameHeader.id, includeCovers);
       case 3:
       case 4:
-        if (frameHeader.flags?.format.unsynchronisation) {
+        // ID3v2.4: the tag-header unsynchronisation flag applies to every frame in the tag
+        // (https://id3.org/id3v2.4.0-structure §3.1), a frame-level flag may set it per frame.
+        // For ID3v2.3 the whole tag body was already resynchronised before frame parsing.
+        if (frameHeader.flags?.format.unsynchronisation || (majorVer === 4 && tagUnsynchronisation)) {
           uint8Array = ID3v2Parser.removeUnsyncBytes(uint8Array);
         }
         if (frameHeader.flags?.format.data_length_indicator) {
@@ -144,7 +148,9 @@ export class ID3v2Parser {
       undefined,
       message => new Id3v2ContentError(message)
     );
-    // ID3v2.2 and ID3v2.3 unsynchronise the whole tag, ID3v2.4 flags each frame
+    // ID3v2.2 and ID3v2.3 unsynchronise the whole tag body; ID3v2.4 resynchronises each frame
+    // (frame-level flag, or the tag-header flag which applies to all frames — see readFrameData).
+    // Resynchronising the whole ID3v2.4 body here would corrupt the sync-safe frame sizes.
     if (this.id3Header.flags.unsynchronisation && this.id3Header.version.major < 4) {
       uint8Array = ID3v2Parser.removeUnsyncBytes(uint8Array);
     }
@@ -268,7 +274,8 @@ export class ID3v2Parser {
         this.id3Header.version.major,
         !this.options.skipCovers,
         this.metadata,
-        getMaxMetadataEntries(this.options)
+        getMaxMetadataEntries(this.options),
+        this.id3Header.flags.unsynchronisation
       );
       if (values) {
         tags.push({ id: frameHeader.id, value: values });

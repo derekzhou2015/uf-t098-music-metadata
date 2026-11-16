@@ -92,6 +92,53 @@ describe('Parse RIFF/WAVE audio format', () => {
     assert.deepEqual(metadata.format.codec, 'PCM', 'format.codec');
   });
 
+  it('removes tag-level unsynchronisation from an embedded ID3v2.4 tag (id3 chunk)', async () => {
+    // ID3v2.4: the tag-header unsynchronisation flag applies to every frame
+    // (https://id3.org/id3v2.4.0-structure §3.1); frame sizes stay sync-safe.
+    const syncSafe = (size: number) =>
+      Buffer.from([(size >>> 21) & 0x7f, (size >>> 14) & 0x7f, (size >>> 7) & 0x7f, size & 0x7f]);
+    const frame = (id: string, text: string) => {
+      const stored: number[] = [];
+      for (const byte of Buffer.from(`\x00${text}`, 'latin1')) {
+        stored.push(byte);
+        if (byte === 0xff) {
+          stored.push(0);
+        }
+      }
+      const header = Buffer.alloc(10);
+      header.write(id, 'ascii');
+      header.set(syncSafe(stored.length), 4);
+      return Buffer.concat([header, Buffer.from(stored)]);
+    };
+    const frames = Buffer.concat([frame('TIT2', 'Title \xff\xe0'), frame('TPE1', 'Artist')]);
+    const id3Tag = Buffer.concat([Buffer.from([0x49, 0x44, 0x33, 4, 0, 0x80]), syncSafe(frames.length), frames]);
+
+    const fmt = Buffer.alloc(16);
+    fmt.writeUInt16LE(1, 0); // PCM
+    fmt.writeUInt16LE(2, 2); // stereo
+    fmt.writeUInt32LE(44100, 4);
+    fmt.writeUInt32LE(176400, 8);
+    fmt.writeUInt16LE(4, 12);
+    fmt.writeUInt16LE(16, 14);
+    const chunk = (id: string, payload: Buffer) => {
+      const header = Buffer.alloc(8);
+      header.write(id, 'ascii');
+      header.writeUInt32LE(payload.length, 4);
+      return Buffer.concat([header, payload, Buffer.alloc(payload.length & 1)]);
+    };
+    const wave = Buffer.concat([Buffer.from('WAVE', 'ascii'), chunk('fmt ', fmt), chunk('id3 ', id3Tag)]);
+    const riff = Buffer.alloc(8);
+    riff.write('RIFF', 'ascii');
+    riff.writeUInt32LE(wave.length, 4);
+
+    const metadata = await mm.parseBuffer(Buffer.concat([riff, wave]), 'audio/wav');
+    assert.deepEqual<mm.ITag[]>(metadata.native['ID3v2.4'], [
+      { id: 'TIT2', value: 'Title \xff\xe0' },
+      { id: 'TPE1', value: 'Artist' }
+    ]);
+    assert.strictEqual(metadata.common.title, 'Title \xff\xe0');
+  });
+
   it('should map RIFF tags to common', async () => {
     // Metadata edited with Adobe Audition CC 2018.1
     const filePath = path.join(samplePath, 'riff_adobe_audition.wav');

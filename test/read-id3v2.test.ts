@@ -701,6 +701,47 @@ describe('ID3v2', () => {
       });
     }
 
+    // ID3v2.4: the tag-header unsynchronisation flag applies to every frame in the tag
+    // (https://id3.org/id3v2.4.0-structure §3.1); frame sizes stay sync-safe and count the
+    // stored, still unsynchronised bytes, so resynchronisation happens per frame.
+    function unsynchronisedTagV24(frameLevelFlags: boolean): Buffer {
+      const frame = (id: string, text: string) => {
+        const stored: number[] = [];
+        for (const byte of Buffer.from(`\x00${text}`, 'latin1')) {
+          stored.push(byte);
+          if (byte === 0xff) {
+            stored.push(0);
+          }
+        }
+        const header = Buffer.alloc(10);
+        header.write(id, 'ascii');
+        header.set(syncSafe(stored.length), 4);
+        if (frameLevelFlags) {
+          header[9] = 0x02; // format flag: unsynchronisation
+        }
+        return Buffer.concat([header, Buffer.from(stored)]);
+      };
+      const frames = Buffer.concat([frame('TIT2', 'Title \xff\xe0'), frame('TPE1', 'Artist')]);
+      return Buffer.concat([Buffer.from([0x49, 0x44, 0x33, 4, 0, 0x80]), syncSafe(frames.length), frames]);
+    }
+
+    it('removes tag-level unsynchronisation from ID3v2.4 frames without frame-level flags', async () => {
+      const metadata = await mm.parseBuffer(unsynchronisedTagV24(false), 'audio/mpeg');
+      assert.deepEqual<mm.ITag[]>(metadata.native['ID3v2.4'], [
+        { id: 'TIT2', value: 'Title \xff\xe0' },
+        { id: 'TPE1', value: 'Artist' }
+      ]);
+      assert.strictEqual(metadata.common.title, 'Title \xff\xe0');
+    });
+
+    it('keeps ID3v2.4 frame-level unsynchronisation flags authoritative alongside the tag-level flag', async () => {
+      const metadata = await mm.parseBuffer(unsynchronisedTagV24(true), 'audio/mpeg');
+      assert.deepEqual<mm.ITag[]>(metadata.native['ID3v2.4'], [
+        { id: 'TIT2', value: 'Title \xff\xe0' },
+        { id: 'TPE1', value: 'Artist' }
+      ]);
+    });
+
     it('reads every frame of an unsynchronised ID3v2.3 tag (issue-979.mp3)', async () => {
       const { native } = await mm.parseFile(path.join(samplePath, 'mp3', 'issue-979.mp3'));
       const id3v23 = mm.orderTags(native['ID3v2.3']);
